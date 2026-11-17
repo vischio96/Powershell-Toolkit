@@ -3,6 +3,8 @@ AD_Report_*.html
 AD_Report_*_csv/
 Report_Permessi_*.html
 Report_Permessi_*_csv/
+Report_FileAudit*.html
+*.evtx
 *.csv
 
 # File temporanei

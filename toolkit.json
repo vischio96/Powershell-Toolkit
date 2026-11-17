@@ -11,6 +11,12 @@
       "name": "Report permessi cartelle e condivisioni",
       "folder": "Report permessi cartelle e condivisioni",
       "script": "Get-SharePermissionReport.ps1"
+    },
+    {
+      "slug": "file-audit-report",
+      "name": "Report auditing file",
+      "folder": "Report auditing file",
+      "script": "Analizza-Evtx.ps1"
     }
   ]
 }
