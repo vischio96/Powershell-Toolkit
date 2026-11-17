@@ -19,11 +19,14 @@
       - Deleghe Kerberos (non vincolate, vincolate, resource-based)
       - Account di servizio gestiti (MSA / gMSA / dMSA)
       - Struttura ad albero delle OU con GPO collegate e GPO risultanti (ereditarietà, blocco, imposizione)
-      - Elenco GPO con stato, collegamenti, filtri WMI, coerenza SYSVOL
-      - Permessi NTFS (e di condivisione, se UNC) di un percorso con struttura ad albero
-      - (Opzionale) accessi falliti e blocchi account letti dai registri di sicurezza dei DC
+      - Elenco GPO con stato, collegamenti, filtri WMI, coerenza SYSVOL, password GPP (cpassword) in SYSVOL
+      - Protocolli e hardening dei DC: LDAP signing, channel binding, LDAPS (certificato e TLS), NTLM / LM,
+        SMB signing e SMBv1, TLS 1.0/1.1, cifrature Kerberos (RC4/DES), Netlogon (Zerologon), WDigest, LSA,
+        Print Spooler, aggiornamenti DNS non sicuri, accessi anonimi, diritti DCSync, modelli AD CS vulnerabili
+      - (Opzionale) accessi falliti, blocchi account e accessi NTLMv1 letti dai registri di sicurezza dei DC
 
-    Lo script è in SOLA LETTURA: non modifica nulla in Active Directory né sul file system.
+    Lo script è in SOLA LETTURA: non modifica nulla in Active Directory né sui Domain Controller.
+    Richiede una sessione con privilegi elevati (se necessario si riavvia chiedendo l'elevazione UAC).
 
 .PARAMETER OutputFolder
     Cartella in cui salvare il report. Predefinito: cartella dello script.
@@ -31,21 +34,13 @@
 .PARAMETER Server
     Domain Controller da interrogare. Predefinito: emulatore PDC (dato più preciso per tentativi errati e blocchi).
 
-.PARAMETER FolderPath
-    Uno o più percorsi (locali o UNC) di cui analizzare i permessi. Se omesso viene mostrata una finestra
-    di selezione della cartella (Annulla = salta l'analisi).
+.PARAMETER SkipProtocolChecks
+    Non esegue i controlli di protocollo/hardening sui Domain Controller (registro, servizi, LDAPS).
+    I controlli via LDAP (DCSync, AD CS, dsHeuristics, GPP) vengono comunque eseguiti.
 
-.PARAMETER FolderDepth
-    Profondità massima delle sottocartelle da analizzare (predefinito 5).
-
-.PARAMETER MaxFolders
-    Numero massimo di cartelle analizzate per evitare report enormi (predefinito 10000).
-
-.PARAMETER IncludeInheritedAces
-    Mostra nell'albero anche le ACE ereditate di ogni sottocartella (di default solo quelle esplicite).
-
-.PARAMETER SkipFolderReport
-    Non esegue l'analisi dei permessi delle cartelle.
+.PARAMETER NoElevation
+    Non richiede l'elevazione UAC se la sessione non è amministrativa (sconsigliato: alcune informazioni
+    potrebbero risultare incomplete o errate).
 
 .PARAMETER InactiveDays
     Giorni senza logon oltre i quali un account è considerato inattivo (predefinito 90).
@@ -61,7 +56,8 @@
     Risolve via DNS l'indirizzo IPv4 dei computer (può rallentare molto con molti oggetti obsoleti).
 
 .PARAMETER IncludeSecurityEvents
-    Legge dai registri Security dei DC gli eventi 4625, 4771, 4776 (accessi falliti) e 4740 (blocchi).
+    Legge dai registri Security dei DC gli eventi 4625, 4771, 4776 (accessi falliti), 4740 (blocchi)
+    e 4624 con autenticazione NTLM V1.
 
 .PARAMETER EventHours
     Finestra temporale in ore per gli eventi (predefinito 24).
@@ -79,25 +75,23 @@
     .\Get-ADSecurityReport.ps1
 
 .EXAMPLE
-    .\Get-ADSecurityReport.ps1 -FolderPath '\\FS01\Dati','D:\Condivisioni' -FolderDepth 3 -ExportCsv -OpenReport
+    .\Get-ADSecurityReport.ps1 -ExportCsv -OpenReport
 
 .EXAMPLE
-    .\Get-ADSecurityReport.ps1 -QueryAllDCs -IncludeSecurityEvents -EventHours 48 -SkipFolderReport
+    .\Get-ADSecurityReport.ps1 -QueryAllDCs -IncludeSecurityEvents -EventHours 48
 
 .NOTES
     Requisiti: Windows PowerShell 5.1 o PowerShell 7 su Windows, modulo ActiveDirectory (RSAT).
-    Consigliato eseguire con un account con ampi diritti di lettura (es. Domain Admin o account delegato):
-    con un utente standard alcune informazioni (BitLocker, FGPP, eventi, alcune ACL) potrebbero non essere visibili.
+    Eseguire in una sessione elevata con un account con ampi diritti di lettura (es. Domain Admin o account delegato):
+    con un utente standard alcune informazioni (BitLocker, FGPP, eventi, registro dei DC, alcune ACL) non sono visibili.
+    I controlli di protocollo sui DC usano WinRM (Invoke-Command) con fallback sul Registro remoto.
 #>
 [CmdletBinding()]
 param(
     [string]$OutputFolder,
     [string]$Server,
-    [string[]]$FolderPath,
-    [ValidateRange(0, 50)][int]$FolderDepth = 5,
-    [ValidateRange(1, 500000)][int]$MaxFolders = 10000,
-    [switch]$IncludeInheritedAces,
-    [switch]$SkipFolderReport,
+    [switch]$SkipProtocolChecks,
+    [switch]$NoElevation,
     [ValidateRange(1, 3650)][int]$InactiveDays = 90,
     [ValidateRange(1, 3650)][int]$PasswordAgeDays = 365,
     [switch]$QueryAllDCs,
@@ -110,7 +104,38 @@ param(
 )
 
 Set-StrictMode -Off
-$ScriptVersion = '1.0'
+$ScriptVersion = '2.0'
+
+#region ===================== ELEVAZIONE =====================
+# Senza token amministrativo (UAC) alcune informazioni risultano incomplete o errate (es. stato degli account,
+# registro e servizi dei DC, registri eventi): se necessario lo script si riavvia chiedendo l'elevazione.
+$IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $IsAdmin -and -not $NoElevation) {
+    if (-not $PSCommandPath) {
+        Write-Error 'Eseguire lo script da file (.ps1) in una sessione PowerShell avviata come amministratore.'
+        return
+    }
+    $argList = New-Object System.Collections.Generic.List[string]
+    $argList.AddRange([string[]]@('-NoProfile', '-ExecutionPolicy', 'Bypass', '-NoExit', '-File', "`"$PSCommandPath`""))
+    foreach ($kv in $PSBoundParameters.GetEnumerator()) {
+        if ($kv.Value -is [System.Management.Automation.SwitchParameter]) {
+            if ($kv.Value.IsPresent) { $argList.Add("-$($kv.Key)") }
+        } else {
+            $argList.Add("-$($kv.Key)")
+            $argList.Add("`"$(([string]$kv.Value).TrimEnd('\'))`"")
+        }
+    }
+    Write-Host 'La sessione non è elevata: riavvio dello script come amministratore (confermare la richiesta UAC)...' -ForegroundColor Yellow
+    try {
+        Start-Process -FilePath (Get-Process -Id $PID).Path -Verb RunAs -ArgumentList ($argList -join ' ') -ErrorAction Stop | Out-Null
+    } catch {
+        Write-Error "Elevazione non riuscita o annullata: $($_.Exception.Message). Avviare PowerShell come amministratore oppure usare -NoElevation (sconsigliato)."
+    }
+    return
+}
+if (-not $IsAdmin) { Write-Warning 'Sessione NON elevata (-NoElevation): alcune informazioni potrebbero essere incomplete o errate.' }
+#endregion
+
 $StartTime = Get-Date
 $Now = $StartTime
 $InactiveLimit = $Now.AddDays(-$InactiveDays)
@@ -168,13 +193,11 @@ function Get-DaysSince {
 }
 
 function Get-List {
-    # Restituisce sempre un array (vuoto se il valore è nullo), senza elementi vuoti
+    # Restituisce gli elementi non vuoti di un valore multiplo. Usare SEMPRE come @(Get-List ...):
+    # l'output è enumerato sulla pipeline (niente "return , array", che dentro @() crea array annidati).
     param($Value)
-    $out = New-Object System.Collections.Generic.List[object]
-    if ($null -ne $Value) {
-        foreach ($v in $Value) { if ($null -ne $v -and "$v" -ne '') { $out.Add($v) } }
-    }
-    return , $out.ToArray()
+    if ($null -eq $Value) { return }
+    foreach ($v in $Value) { if ($null -ne $v -and "$v" -ne '') { $v } }
 }
 
 function Get-ParentDN {
@@ -442,23 +465,25 @@ function Get-EffectiveGroupSet {
 
 # ---- GPO ----
 function Get-GpLinks {
-    # Analizza l'attributo gPLink; restituisce i collegamenti in ordine di collegamento (1 = precedenza massima)
+    # Analizza l'attributo gPLink; restituisce i collegamenti in ordine di collegamento (1 = precedenza massima).
+    # Usare come @(Get-GpLinks ...). In v1.0 il "return , $list" dentro @() produceva un array annidato:
+    # con più GPO collegate allo stesso contenitore causava l'errore "La raccolta è a dimensione fissa".
     param([string]$GpLink)
-    if ([string]::IsNullOrWhiteSpace($GpLink)) { return , @() }
-    $list = @()
+    if ([string]::IsNullOrWhiteSpace($GpLink)) { return }
+    $list = New-Object System.Collections.Generic.List[object]
     foreach ($m in [regex]::Matches($GpLink, '\[LDAP://([^;\]]+);(\d+)\]', 'IgnoreCase')) {
         $dn = $m.Groups[1].Value
         $opt = [int]$m.Groups[2].Value
         $guid = ([regex]::Match($dn, '\{[0-9A-Fa-f\-]{36}\}')).Value.ToUpper()
-        $list += [pscustomobject]@{ Guid = $guid; Enabled = -not ($opt -band 1); Enforced = [bool]($opt -band 2); Order = 0 }
+        if (-not $guid) { continue }
+        $list.Add([pscustomobject]@{ Guid = $guid; Enabled = -not ($opt -band 1); Enforced = [bool]($opt -band 2); Order = 0 })
     }
-    [array]::Reverse($list)
+    $list.Reverse()
     $i = 1
-    foreach ($l in $list) { $l.Order = $i; $i++ }
-    return , $list
+    foreach ($l in $list) { $l.Order = $i; $i++; $l }
 }
 
-# ---- Permessi NTFS ----
+# ---- Risoluzione SID ----
 $script:SidNameCache = @{}
 function Resolve-SidName {
     param([string]$Sid)
@@ -469,42 +494,19 @@ function Resolve-SidName {
     return $n
 }
 
-function Get-RightsText {
-    param([int64]$Mask)
-    $m = $Mask -band 4294967295
-    $parts = New-Object System.Collections.Generic.List[string]
-    if ($m -band 268435456) { $parts.Add('Controllo completo (generico)') }
-    if ($m -band 2147483648) { $parts.Add('Lettura (generico)') }
-    if ($m -band 1073741824) { $parts.Add('Scrittura (generico)') }
-    if ($m -band 536870912) { $parts.Add('Esecuzione (generico)') }
-    $std = $m -band 268435455
-    if ($std -ne 0) {
-        $s = $std -bor 1048576
-        $name = switch ($s) {
-            2032127 { 'Controllo completo' }
-            1245631 { 'Modifica' }
-            1180095 { 'Lettura ed esecuzione + Scrittura' }
-            1180063 { 'Lettura + Scrittura' }
-            1179817 { 'Lettura ed esecuzione' }
-            1179785 { 'Lettura' }
-            1048854 { 'Scrittura' }
-            default { $null }
-        }
-        if (-not $name) { $name = 'Speciali: ' + ([System.Security.AccessControl.FileSystemRights][int]$std).ToString() }
-        $parts.Add($name)
-    }
-    return ($parts -join ', ')
-}
-
-function Get-AppliesTo {
-    param([int]$Inh, [int]$Prop)
-    $ci = ($Inh -band 1) -ne 0; $oi = ($Inh -band 2) -ne 0
-    $np = ($Prop -band 1) -ne 0; $io = ($Prop -band 2) -ne 0
-    if (-not $ci -and -not $oi) { $t = 'Solo questa cartella' }
-    elseif ($io) { $t = if ($ci -and $oi) { 'Solo sottocartelle e file' } elseif ($ci) { 'Solo sottocartelle' } else { 'Solo file' } }
-    else { $t = if ($ci -and $oi) { 'Questa cartella, sottocartelle e file' } elseif ($ci) { 'Questa cartella e sottocartelle' } else { 'Questa cartella e file' } }
-    if ($np) { $t += ' (solo primo livello)' }
-    return $t
+function Format-EncTypes {
+    # Decodifica msDS-SupportedEncryptionTypes / SupportedEncryptionTypes
+    param($Value)
+    if ($null -eq $Value -or "$Value" -eq '' -or [int64]$Value -eq 0) { return 'Non impostato (predefinito)' }
+    $v = [int64]$Value
+    $names = @()
+    if ($v -band 1) { $names += 'DES-CBC-CRC' }
+    if ($v -band 2) { $names += 'DES-CBC-MD5' }
+    if ($v -band 4) { $names += 'RC4-HMAC' }
+    if ($v -band 8) { $names += 'AES128' }
+    if ($v -band 16) { $names += 'AES256' }
+    if ($v -band 32) { $names += 'AES256-SK' }
+    return ('{0} (0x{1:X})' -f ($names -join ', '), $v)
 }
 
 #endregion
@@ -547,21 +549,6 @@ if (-not (Test-Path -LiteralPath $OutputFolder)) { New-Item -ItemType Directory 
 $ReportFile = Join-Path $OutputFolder ('AD_Report_{0}_{1}.html' -f $DnsRoot, $stamp)
 $CsvFolder = Join-Path $OutputFolder ('AD_Report_{0}_{1}_csv' -f $DnsRoot, $stamp)
 
-# Selezione della cartella per il report permessi (all'inizio, per non bloccare a metà esecuzione)
-if (-not $SkipFolderReport -and -not $FolderPath -and [Environment]::UserInteractive) {
-    $sel = $null
-    try {
-        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
-        $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
-        $dlg.Description = 'Seleziona la cartella di cui analizzare i permessi (Annulla per saltare)'
-        $dlg.ShowNewFolderButton = $false
-        if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $sel = $dlg.SelectedPath }
-    } catch {
-        $sel = Read-Host 'Percorso della cartella di cui analizzare i permessi (INVIO per saltare)'
-    }
-    if ($sel) { $FolderPath = @($sel) }
-}
-
 function Test-SchemaAttribute {
     param([string]$Name)
     try { return [bool](Get-ADObject -SearchBase $SchemaNC -LDAPFilter "(lDAPDisplayName=$Name)" @adParams -ErrorAction Stop) } catch { return $false }
@@ -585,7 +572,9 @@ $SchemaText = if ($SchemaVersion) { "$SchemaVersion ($($SchemaMap[[int]$SchemaVe
 $RecycleBin = Invoke-Safe 'Cestino AD' { Get-ADOptionalFeature -Filter "Name -like 'Recycle Bin Feature'" @adParams -ErrorAction Stop }
 $RecycleEnabled = [bool]($RecycleBin -and @($RecycleBin.EnabledScopes).Count -gt 0)
 
-$Tombstone = Invoke-Safe 'Tombstone' { (Get-ADObject "CN=Directory Service,CN=Windows NT,CN=Services,$ConfigNC" -Properties tombstoneLifetime @adParams -ErrorAction Stop).tombstoneLifetime }
+$DsObj = Invoke-Safe 'Directory Service' { Get-ADObject "CN=Directory Service,CN=Windows NT,CN=Services,$ConfigNC" -Properties tombstoneLifetime, dSHeuristics @adParams -ErrorAction Stop }
+$Tombstone = if ($DsObj) { $DsObj.tombstoneLifetime } else { $null }
+$DsHeuristics = if ($DsObj) { [string]$DsObj.dSHeuristics } else { '' }
 
 $DCs = @(Invoke-Safe 'Domain Controller' { Get-ADDomainController -Filter * @adParams -ErrorAction Stop } | Where-Object { $_ })
 
@@ -753,13 +742,12 @@ $UserProps = @('DisplayName', 'UserPrincipalName', 'Enabled', 'LastLogonDate', '
     'AllowReversiblePasswordEncryption', 'AccountExpirationDate', 'msDS-UserPasswordExpiryTimeComputed', 'whenCreated', 'whenChanged',
     'Description', 'Title', 'Department', 'Company', 'Office', 'EmailAddress', 'telephoneNumber', 'Manager', 'MemberOf', 'PrimaryGroupID',
     'adminCount', 'SIDHistory', 'servicePrincipalName', 'msDS-AllowedToDelegateTo', 'TrustedForDelegation', 'TrustedToAuthForDelegation',
-    'DoesNotRequirePreAuth', 'UseDESKeyOnly', 'AccountNotDelegated', 'ScriptPath', 'HomeDirectory', 'ProfilePath', 'logonCount')
+    'DoesNotRequirePreAuth', 'UseDESKeyOnly', 'AccountNotDelegated', 'ScriptPath', 'HomeDirectory', 'ProfilePath', 'logonCount', 'msDS-SupportedEncryptionTypes')
 $RawUsers = @()
 try { $RawUsers = @(Get-ADUser -Filter * -Properties $UserProps @adParams -ErrorAction Stop) } catch { Add-Log 'Utenti' $_.Exception.Message }
 
 $PwdInDescPattern = '(?i)(passw(or)?d|pwd|psw|parola\s*chiave|kennwort|mot de passe)\s*[:=]'
 $Users = New-Object System.Collections.Generic.List[object]
-$Stat = @{}
 $i = 0
 foreach ($u in $RawUsers) {
     $i++
@@ -775,7 +763,7 @@ foreach ($u in $RawUsers) {
     $lastLogon = Get-BestLastLogon $u
     $daysLogon = Get-DaysSince $lastLogon
     $pwdAge = Get-DaysSince $u.PasswordLastSet
-    $direct = Get-List $u.MemberOf
+    $direct = @(Get-List $u.MemberOf)
     $primaryDN = $GroupDnByRid[$pgKey]
     $eff = Get-EffectiveGroupSet -Direct $direct -Primary $primaryDN
     $privHits = @(foreach ($pd in $PrivGroups.Keys) { if ($eff.Contains($pd)) { $PrivGroups[$pd].Display } })
@@ -783,8 +771,8 @@ foreach ($u in $RawUsers) {
     $inPU = [bool]($ProtectedUsersDN -and $eff.Contains($ProtectedUsersDN))
     $isAdminSd = $false
     foreach ($a in $AdminSdDNs) { if ($eff.Contains($a)) { $isAdminSd = $true; break } }
-    $spns = Get-List $u.servicePrincipalName
-    $delegTo = Get-List $u.'msDS-AllowedToDelegateTo'
+    $spns = @(Get-List $u.servicePrincipalName)
+    $delegTo = @(Get-List $u.'msDS-AllowedToDelegateTo')
     $sidHist = @(Get-List $u.SIDHistory | ForEach-Object { [string]$_ })
     $isKrbtgt = ($sid -eq "$DomainSID-502") -or ($sam -like 'krbtgt_*')
     $never = -not $lastLogon
@@ -818,6 +806,7 @@ foreach ($u in $RawUsers) {
         if ($u.DoesNotRequirePreAuth) { $risks.Add('AS-REP roastable'); Add-FL 'u.asrep' $lbl }
         if ($u.UseDESKeyOnly) { $risks.Add('Solo DES'); Add-FL 'u.des' $lbl }
         if ($kerberoast) { $risks.Add('Kerberoastable (SPN)'); Add-FL 'u.kerberoast' "$lbl - $($spns -join ', ')" }
+        if ($kerberoast -and (([int]$u.'msDS-SupportedEncryptionTypes') -band 0x18) -eq 0) { $risks.Add('SPN senza AES (RC4)'); Add-FL 'u.spn.rc4' "$lbl - msDS-SupportedEncryptionTypes: $(Format-EncTypes $u.'msDS-SupportedEncryptionTypes')" }
         if ($u.TrustedForDelegation) { $risks.Add('Delega non vincolata'); Add-FL 'u.unconstrained' $lbl }
         if ($delegTo.Count -or $u.TrustedToAuthForDelegation) { Add-FL 'u.constrained' "$lbl -> $($delegTo -join ', ')" }
         if ($u.PasswordNeverExpires -and -not $isKrbtgt) { $risks.Add('Password senza scadenza'); Add-FL 'u.neverexpires' $lbl }
@@ -935,7 +924,7 @@ Write-Progress -Activity 'Elaborazione utenti' -Completed
 Write-Step 'Raccolta computer'
 $CompProps = @('DNSHostName', 'Enabled', 'OperatingSystem', 'OperatingSystemVersion', 'OperatingSystemServicePack', 'LastLogonDate', 'PasswordLastSet',
     'whenCreated', 'whenChanged', 'Description', 'Location', 'ManagedBy', 'MemberOf', 'PrimaryGroupID', 'TrustedForDelegation',
-    'TrustedToAuthForDelegation', 'msDS-AllowedToDelegateTo', 'servicePrincipalName', 'badPwdCount', 'LastBadPasswordAttempt', 'SIDHistory')
+    'TrustedToAuthForDelegation', 'msDS-AllowedToDelegateTo', 'servicePrincipalName', 'badPwdCount', 'LastBadPasswordAttempt', 'SIDHistory', 'msDS-SupportedEncryptionTypes')
 if ($HasLegacyLaps) { $CompProps += 'ms-Mcs-AdmPwdExpirationTime' }
 if ($HasWinLaps) { $CompProps += 'msLAPS-PasswordExpirationTime' }
 if ($HasRBCD) { $CompProps += 'msDS-AllowedToActOnBehalfOfOtherIdentity' }
@@ -959,11 +948,11 @@ foreach ($c in $RawComputers) {
     $PrimaryCount[$pgKey] = 1 + [int]$PrimaryCount[$pgKey]
     $enabled = [bool]$c.Enabled
     $os = $c.OperatingSystem
-    $isWindows = $os -match 'Windows'
+    $isWinOs = $os -match 'Windows'
     $type = switch ($c.PrimaryGroupID) {
         516 { 'Domain Controller' }
         521 { 'RODC' }
-        default { if ($os -match 'Server') { 'Server' } elseif ($isWindows) { 'Workstation' } elseif ($os) { 'Altro' } else { 'Sconosciuto' } }
+        default { if ($os -match 'Server') { 'Server' } elseif ($isWinOs) { 'Workstation' } elseif ($os) { 'Altro' } else { 'Sconosciuto' } }
     }
     $isDC = $type -in 'Domain Controller', 'RODC'
     $sup = Get-OsSupport $os $c.OperatingSystemVersion
@@ -971,11 +960,11 @@ foreach ($c in $RawComputers) {
     $never = -not $lastLogon
     $inactive = $enabled -and (($lastLogon -and $lastLogon -lt $InactiveLimit) -or ($never -and $c.whenCreated -lt $InactiveLimit))
     $pwdAge = Get-DaysSince $c.PasswordLastSet
-    $direct = Get-List $c.MemberOf
+    $direct = @(Get-List $c.MemberOf)
     $primaryDN = $GroupDnByRid[$pgKey]
     $eff = Get-EffectiveGroupSet -Direct $direct -Primary $primaryDN
-    $spns = Get-List $c.servicePrincipalName
-    $delegTo = Get-List $c.'msDS-AllowedToDelegateTo'
+    $spns = @(Get-List $c.servicePrincipalName)
+    $delegTo = @(Get-List $c.'msDS-AllowedToDelegateTo')
     $sidHist = @(Get-List $c.SIDHistory | ForEach-Object { [string]$_ })
 
     # LAPS
@@ -985,7 +974,7 @@ foreach ($c in $RawComputers) {
     if ($lapsWin) { $lapsTypes += 'Windows LAPS' }
     if ($lapsLegacy) { $lapsTypes += 'LAPS legacy' }
     $lapsExp = if ($lapsWin) { $lapsWin } else { $lapsLegacy }
-    $lapsNeeded = $enabled -and $isWindows -and -not $isDC
+    $lapsNeeded = $enabled -and $isWinOs -and -not $isDC
     $lapsCell = if ($lapsTypes.Count) { New-Badge ($lapsTypes -join ' + ') 'b-ok' } elseif ($lapsNeeded) { New-Badge 'No' 'b-high' } else { 'N/D' }
 
     # Deleghe
@@ -1086,7 +1075,7 @@ Write-Step 'Elaborazione gruppi'
 $Groups = New-Object System.Collections.Generic.List[object]
 foreach ($g in $RawGroups) {
     Add-ContainerCount $g.DistinguishedName 'G'
-    $members = Get-List $g.member
+    $members = @(Get-List $g.member)
     $sid = $g.SID.Value
     $rid = if ($sid.StartsWith("$DomainSID-")) { $sid.Substring($DomainSID.Length + 1) } else { '' }
     $pc = if ($rid) { [int]$PrimaryCount[$rid] } else { 0 }
@@ -1100,7 +1089,7 @@ foreach ($g in $RawGroups) {
 
     # Gruppi annidati in gruppi privilegiati
     $geff = Get-GroupClosure $g.DistinguishedName
-    $gdirect = Get-List $g.MemberOf
+    $gdirect = @(Get-List $g.MemberOf)
     foreach ($pd in $PrivGroups.Keys) {
         if ($geff.Contains($pd)) {
             $PrivRows.Add([pscustomobject][ordered]@{
@@ -1561,7 +1550,7 @@ $MsaRows = foreach ($m in ($MsaRaw | Sort-Object Name)) {
         'Nome' = $m.Name; 'Tipo' = $typeTxt
         'Stato' = $(if ($m.Enabled) { New-Badge 'Attivo' 'b-ok' } else { New-Badge 'Disabilitato' 'b-off' })
         'Ultimo logon' = $m.LastLogonDate; 'Password impostata' = $m.PasswordLastSet
-        'SPN' = Get-List $m.ServicePrincipalNames
+        'SPN' = @(Get-List $m.ServicePrincipalNames)
         'Autorizzati a recuperare la password' = @(Get-List $m.PrincipalsAllowedToRetrieveManagedPassword | ForEach-Object { Get-RdnName $_ })
         'Creato' = $m.whenCreated; 'Descrizione' = $m.Description
     }
@@ -1569,172 +1558,481 @@ $MsaRows = foreach ($m in ($MsaRaw | Sort-Object Name)) {
 
 #endregion
 
-#region ===================== PERMESSI CARTELLE =====================
+#region ===================== PROTOCOLLI E HARDENING =====================
 
-$FolderSections = New-Object System.Collections.Generic.List[string]
-$FolderExceptions = New-Object System.Collections.Generic.List[object]
-$FolderRisky = New-Object System.Collections.Generic.List[object]
-$FolderErrors = New-Object System.Collections.Generic.List[object]
-$FolderAces = New-Object System.Collections.Generic.List[object]
-$script:FolderCount = 0
-$script:FolderTruncated = $false
-# SID "ampi": Everyone, Anonymous, Authenticated Users, Users, Guests, Domain Users, Domain Guests, Domain Computers
-$BroadSids = @('S-1-1-0', 'S-1-5-7', 'S-1-5-11', 'S-1-5-32-545', 'S-1-5-32-546', "$DomainSID-513", "$DomainSID-514", "$DomainSID-515")
-# Diritti di scrittura/modifica: WriteData, AppendData, WriteEA, DeleteSubdirs, WriteAttributes, Delete, ChangePermissions, TakeOwnership, GENERIC_ALL, GENERIC_WRITE
-$RiskyMask = 2 -bor 4 -bor 16 -bor 64 -bor 256 -bor 65536 -bor 262144 -bor 524288 -bor 268435456 -bor 1073741824
+Write-Step 'Controlli di protocollo e hardening'
+$ProtoRows = New-Object System.Collections.Generic.List[object]
+$LdapsRows = New-Object System.Collections.Generic.List[object]
+$DnsZoneRows = New-Object System.Collections.Generic.List[object]
+$DomainHardRows = New-Object System.Collections.Generic.List[object]
+$AclRiskRows = New-Object System.Collections.Generic.List[object]
+$GppRows = New-Object System.Collections.Generic.List[object]
+$AdcsRows = New-Object System.Collections.Generic.List[object]
+$DcProbeStatus = New-Object System.Collections.Generic.List[object]
 
-function Get-FolderAclNode {
-    param([string]$Path, [int]$Level, [bool]$NoRecurse)
-    $script:FolderCount++
-    if ($script:FolderCount % 200 -eq 0) { Write-Progress -Activity 'Analisi permessi cartelle' -Status "$($script:FolderCount) cartelle - $Path" }
-    $name = if ($Level -eq 0) { $Path } else { [System.IO.Path]::GetFileName($Path.TrimEnd('\')) }
-    $node = [pscustomobject]@{
-        Path = $Path; Name = $name; Level = $Level; Owner = ''; Protected = $false; Aces = @(); ExplicitCount = 0
-        Risky = $false; Error = $null; Note = $null; Truncated = $false; Children = (New-Object System.Collections.Generic.List[object])
+function Add-ProtoRow {
+    param([string]$DC, [string]$Area, [string]$Setting, $Value, [string]$Recommended,
+        [ValidateSet('OK', 'Attenzione', 'Critico', 'Info', 'N/D')][string]$Result, [string]$FlKey)
+    $cls = switch ($Result) { 'OK' { 'b-ok' } 'Attenzione' { 'b-med' } 'Critico' { 'b-high' } 'N/D' { 'b-off' } default { 'b-info' } }
+    if ($FlKey -and $Result -in 'Attenzione', 'Critico') { Add-FL $FlKey "$DC - $($Setting): $Value" }
+    $ProtoRows.Add([pscustomobject][ordered]@{
+            'Domain Controller' = $DC; 'Area' = $Area; 'Impostazione' = $Setting; 'Valore attuale' = $Value
+            'Valore consigliato' = $Recommended; 'Esito' = (New-Badge $Result $cls); '_RowClass' = "r-$($Result -replace '/', '')"
+        })
+}
+
+# Valori di registro letti su ogni DC (percorso|nome)
+$RegList = @(
+    'HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters|LDAPServerIntegrity'
+    'HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters|LdapEnforceChannelBinding'
+    'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa|LmCompatibilityLevel'
+    'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa|NoLMHash'
+    'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa|RestrictAnonymous'
+    'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa|RestrictAnonymousSAM'
+    'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa|EveryoneIncludesAnonymous'
+    'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa|RunAsPPL'
+    'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa|LsaCfgFlags'
+    'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0|NtlmMinServerSec'
+    'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0|RestrictReceivingNTLMTraffic'
+    'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0|AuditReceivingNTLMTraffic'
+    'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters|RestrictNTLMInDomain'
+    'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters|AuditNTLMInDomain'
+    'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters|RequireSignOrSeal'
+    'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters|RequireStrongKey'
+    'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters|VulnerableChannelAllowList'
+    'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters|RequireSecuritySignature'
+    'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters|SMB1'
+    'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest|UseLogonCredential'
+    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Kerberos\Parameters|SupportedEncryptionTypes'
+    'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.0\Server|Enabled'
+    'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.1\Server|Enabled'
+    'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\SSL 3.0\Server|Enabled'
+    'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient|EnableMulticast'
+    'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\Parameters|Type'
+    'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\Parameters|NtpServer'
+)
+
+# Raccolta eseguita SUL Domain Controller (via WinRM o localmente se lo script gira sul DC)
+$DcProbe = {
+    param([string[]]$RegList)
+    $reg = @{}
+    foreach ($item in $RegList) {
+        $i = $item.LastIndexOf('|'); $p = $item.Substring(0, $i); $n = $item.Substring($i + 1)
+        try { $v = (Get-ItemProperty -LiteralPath $p -Name $n -ErrorAction Stop).$n; if ($null -ne $v) { $reg[$item] = $v } } catch { }
     }
+    $spooler = $null
+    try { $s = Get-Service -Name Spooler -ErrorAction Stop; $spooler = "$($s.Status) / $($s.StartType)" } catch { }
+    $smb = $null
+    try { $c = Get-SmbServerConfiguration -ErrorAction Stop; $smb = [pscustomobject]@{ SMB1 = [bool]$c.EnableSMB1Protocol; RequireSign = [bool]$c.RequireSecuritySignature; Encrypt = [bool]$c.EncryptData } } catch { }
+    $zones = @()
     try {
-        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
-        try {
-            $osid = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
-            $on = Resolve-SidName $osid
-            $node.Owner = if ($on) { $on } else { "$osid (non risolto)" }
-        } catch { $node.Owner = $acl.Owner }
-        $node.Protected = [bool]$acl.AreAccessRulesProtected
-        if ($node.Protected -and $Level -gt 0) { $node.Note = 'Ereditarietà disabilitata' }
-        $aces = New-Object System.Collections.Generic.List[object]
-        foreach ($r in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
-            $sid = $r.IdentityReference.Value
-            $rn = Resolve-SidName $sid
-            $idName = if ($rn) { $rn } else { "$sid (non risolto)" }
-            $mask = [int64][int]$r.FileSystemRights
-            $allow = ([string]$r.AccessControlType -eq 'Allow')
-            $rights = Get-RightsText $mask
-            $applies = Get-AppliesTo ([int]$r.InheritanceFlags) ([int]$r.PropagationFlags)
-            $risky = [bool]($allow -and ($BroadSids -contains $sid) -and (($mask -band 4294967295) -band $RiskyMask))
-            $orphan = (-not $rn) -and $sid -like 'S-1-5-21-*'
-            $ace = [pscustomobject]@{ Identity = $idName; Sid = $sid; Allow = $allow; Rights = $rights; AppliesTo = $applies; Inherited = [bool]$r.IsInherited; Risky = $risky; Orphan = $orphan }
-            $aces.Add($ace)
-            if (-not $r.IsInherited) { $node.ExplicitCount++ }
-            if (-not $r.IsInherited -or $Level -eq 0) {
-                $FolderAces.Add([pscustomobject][ordered]@{ 'Percorso' = $Path; 'Identità' = $idName; 'SID' = $sid; 'Tipo' = $(if ($allow) { 'Consenti' } else { 'Nega' }); 'Diritti' = $rights; 'Si applica a' = $applies; 'Ereditata' = [bool]$r.IsInherited })
-                if ($risky) {
-                    $node.Risky = $true
-                    $FolderRisky.Add([pscustomobject][ordered]@{ 'Percorso' = $Path; 'Identità' = $idName; 'Tipo' = 'Consenti'; 'Diritti' = $rights; 'Si applica a' = $applies; 'Ereditata' = [bool]$r.IsInherited })
-                }
-                if ($orphan) { Add-FL 'fs.orphan' "$Path - $sid" }
-            }
+        if (Get-Command Get-DnsServerZone -ErrorAction SilentlyContinue) {
+            $zones = @(Get-DnsServerZone -ErrorAction Stop | Where-Object { -not $_.IsAutoCreated -and [string]$_.ZoneType -eq 'Primary' -and $_.ZoneName -ne 'TrustAnchors' } |
+                    ForEach-Object { [pscustomobject]@{ Zone = $_.ZoneName; DynamicUpdate = [string]$_.DynamicUpdate; DsIntegrated = [bool]$_.IsDsIntegrated; Reverse = [bool]$_.IsReverseLookupZone } })
         }
-        $node.Aces = $aces.ToArray()
-        if ($Level -gt 0 -and ($node.Protected -or $node.ExplicitCount -gt 0)) {
-            $FolderExceptions.Add([pscustomobject][ordered]@{
-                    'Percorso' = $Path; 'Livello' = $Level
-                    'Ereditarietà' = $(if ($node.Protected) { New-Badge 'Disabilitata' 'b-med' } else { 'Attiva' })
-                    'ACE esplicite' = @($aces | Where-Object { -not $_.Inherited } | ForEach-Object { "$($_.Identity): $($_.Rights) ($(if ($_.Allow) { 'Consenti' } else { 'Nega' }))" })
-                    'Proprietario' = $node.Owner
-                })
+    } catch { }
+    $ev2887 = $null
+    try {
+        $e = Get-WinEvent -FilterHashtable @{ LogName = 'Directory Service'; Id = 2887 } -MaxEvents 1 -ErrorAction Stop
+        $ev2887 = [pscustomobject]@{ Time = $e.TimeCreated; Simple = [string]$e.Properties[0].Value; Sasl = [string]$e.Properties[1].Value }
+    } catch { }
+    $cg = $null
+    try { $dg = Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard -ClassName Win32_DeviceGuard -ErrorAction Stop; $cg = [bool](@($dg.SecurityServicesRunning) -contains 1) } catch { }
+    [pscustomobject]@{ Reg = $reg; Spooler = $spooler; Smb = $smb; Zones = $zones; Ev2887 = $ev2887; CredGuard = $cg }
+}
+
+function Get-RemoteRegValues {
+    # Fallback senza WinRM: servizio Registro remoto
+    param([string]$Computer, [string[]]$RegList)
+    $reg = @{}
+    $base = [Microsoft.Win32.RegistryKey]::OpenRemoteBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, $Computer)
+    try {
+        foreach ($item in $RegList) {
+            $i = $item.LastIndexOf('|'); $p = $item.Substring(0, $i) -replace '^HKLM:\\', ''; $n = $item.Substring($i + 1)
+            $k = $base.OpenSubKey($p)
+            if ($k) { $v = $k.GetValue($n); if ($null -ne $v) { $reg[$item] = $v }; $k.Close() }
+        }
+    } finally { $base.Close() }
+    return $reg
+}
+
+function Test-LdapsEndpoint {
+    # Handshake TLS sulla porta 636: certificato, protocollo negoziato e accettazione di TLS 1.0 / 1.1
+    param([string]$HostName, $Protocol)
+    $res = [ordered]@{ Ok = $false; Error = $null; Protocol = $null; Cert = $null; PolicyErrors = $null }
+    $tcp = New-Object System.Net.Sockets.TcpClient
+    try {
+        $iar = $tcp.BeginConnect($HostName, 636, $null, $null)
+        if (-not $iar.AsyncWaitHandle.WaitOne(5000)) { throw 'Porta 636 non raggiungibile (timeout)' }
+        $tcp.EndConnect($iar)
+        $script:LdapsPolicyErrors = $null
+        $cb = [System.Net.Security.RemoteCertificateValidationCallback] { param($s, $c, $ch, $e) $script:LdapsPolicyErrors = $e; return $true }
+        $ssl = New-Object System.Net.Security.SslStream($tcp.GetStream(), $false, $cb)
+        $ssl.ReadTimeout = 8000; $ssl.WriteTimeout = 8000
+        try {
+            if ($null -ne $Protocol) { $ssl.AuthenticateAsClient($HostName, $null, $Protocol, $false) } else { $ssl.AuthenticateAsClient($HostName) }
+            $res.Ok = $true
+            $res.Protocol = [string]$ssl.SslProtocol
+            if ($ssl.RemoteCertificate) { $res.Cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($ssl.RemoteCertificate) }
+            $res.PolicyErrors = [string]$script:LdapsPolicyErrors
+        } finally { $ssl.Dispose() }
+    } catch {
+        $ex = $_.Exception; while ($ex.InnerException) { $ex = $ex.InnerException }
+        $res.Error = $ex.Message
+    } finally { $tcp.Close() }
+    return [pscustomobject]$res
+}
+
+function Test-LdapAnonymousRead {
+    param([string]$HostName)
+    try {
+        Add-Type -AssemblyName System.DirectoryServices.Protocols -ErrorAction Stop
+        $id = New-Object System.DirectoryServices.Protocols.LdapDirectoryIdentifier($HostName, 389)
+        $c = New-Object System.DirectoryServices.Protocols.LdapConnection($id)
+        try {
+            $c.AuthType = [System.DirectoryServices.Protocols.AuthType]::Anonymous
+            $c.SessionOptions.ProtocolVersion = 3
+            $c.Timeout = [timespan]::FromSeconds(10)
+            $c.Bind()
+            $req = New-Object System.DirectoryServices.Protocols.SearchRequest($DomainDN, '(objectClass=user)', [System.DirectoryServices.Protocols.SearchScope]::Subtree, @('sAMAccountName'))
+            $req.SizeLimit = 1
+            $resp = $c.SendRequest($req)
+            if ($resp.Entries.Count -gt 0) { return 'Consentita' }
+            return 'Nessun dato'
+        } finally { $c.Dispose() }
+    } catch { return 'Negata' }
+}
+
+function Get-DcRegValue {
+    # Valore di registro raccolto dal DC corrente ($reg), cercato per nome (ed eventualmente parte del percorso)
+    param([string]$Name, [string]$PathPart = '')
+    $k = @($reg.Keys | Where-Object { $_ -like "*$PathPart*|$Name" }) | Select-Object -First 1
+    if ($k) { return $reg[$k] }
+    return $null
+}
+
+$IsWin2025 = { param($os) [string]$os -match '2025' }
+$TlsProtocols = @(
+    @{ Name = 'TLS 1.0'; Value = [System.Security.Authentication.SslProtocols]192 },
+    @{ Name = 'TLS 1.1'; Value = [System.Security.Authentication.SslProtocols]768 }
+)
+$ZoneSeen = @{}
+
+foreach ($dc in ($DCs | Sort-Object Name)) {
+    $dcName = $dc.Name
+    $os = [string]$dc.OperatingSystem
+
+    # ---- LDAPS (dal computer che esegue lo script) ----
+    Write-Step "LDAPS / LDAP su $($dc.HostName)"
+    $l = Test-LdapsEndpoint -HostName $dc.HostName
+    $tlsLegacy = @()
+    if ($l.Ok) {
+        foreach ($tp in $TlsProtocols) {
+            $lt = Test-LdapsEndpoint -HostName $dc.HostName -Protocol $tp.Value
+            if ($lt.Ok) { $tlsLegacy += $tp.Name }
+        }
+    }
+    $anon = Test-LdapAnonymousRead -HostName $dc.HostName
+    if ($anon -eq 'Consentita') { Add-FL 'proto.anonldap' "$dcName - ricerca LDAP anonima consentita" }
+    $certTxt = ''; $expTxt = $null; $daysLeft = $null; $ldapsEsito = $null
+    if ($l.Ok -and $l.Cert) {
+        $certTxt = $l.Cert.Subject
+        $expTxt = $l.Cert.NotAfter
+        $daysLeft = [int][math]::Floor(($l.Cert.NotAfter - $Now).TotalDays)
+        $trusted = ($l.PolicyErrors -eq 'None')
+        if ($daysLeft -lt 0) { $ldapsEsito = New-Badge 'Certificato scaduto' 'b-high'; Add-FL 'proto.ldaps' "$dcName - certificato scaduto il $(Format-Date $l.Cert.NotAfter)" }
+        elseif (-not $trusted) { $ldapsEsito = New-Badge 'Certificato non attendibile' 'b-med'; Add-FL 'proto.ldaps' "$dcName - certificato non attendibile ($($l.PolicyErrors))" }
+        elseif ($daysLeft -lt 30) { $ldapsEsito = New-Badge "Scade tra $daysLeft gg" 'b-med'; Add-FL 'proto.ldaps' "$dcName - certificato in scadenza ($daysLeft giorni)" }
+        else { $ldapsEsito = New-Badge 'OK' 'b-ok' }
+    } else {
+        $ldapsEsito = New-Badge 'Non disponibile' 'b-med'
+        Add-FL 'proto.ldaps' "$dcName - LDAPS non disponibile: $($l.Error)"
+    }
+    if ($tlsLegacy.Count) { Add-FL 'proto.tlslegacy' "$dcName - LDAPS accetta $($tlsLegacy -join ', ')" }
+    $LdapsRows.Add([pscustomobject][ordered]@{
+            'Domain Controller'          = $dcName
+            'LDAPS (636)'                = $ldapsEsito
+            'Protocollo negoziato'       = $l.Protocol
+            'Certificato (soggetto)'     = $certTxt
+            'Emittente'                  = $(if ($l.Cert) { $l.Cert.Issuer } else { $l.Error })
+            'Scadenza'                   = $expTxt
+            'Giorni residui'             = $daysLeft
+            'Catena attendibile'         = $(if ($l.Ok) { if ($l.PolicyErrors -eq 'None') { 'Sì' } else { New-Badge $l.PolicyErrors 'b-med' } } else { '' })
+            'TLS 1.0/1.1 accettati'      = $(if (-not $l.Ok) { '' } elseif ($tlsLegacy.Count) { New-Badge ($tlsLegacy -join ', ') 'b-med' } else { New-Badge 'No' 'b-ok' })
+            'Ricerca LDAP anonima'       = $(if ($anon -eq 'Consentita') { New-Badge 'Consentita' 'b-high' } else { New-Badge $anon 'b-ok' })
+        })
+
+    if ($SkipProtocolChecks) { continue }
+
+    # ---- Configurazione del DC (registro, servizi, SMB, DNS, eventi) ----
+    Write-Step "Configurazione di sicurezza di $($dc.HostName)"
+    $data = $null; $method = $null; $probeErr = $null
+    $isLocal = ($dcName -eq $env:COMPUTERNAME)
+    try {
+        if ($isLocal) { $data = & $DcProbe $RegList; $method = 'Locale' }
+        else {
+            $so = New-PSSessionOption -OpenTimeout 15000 -OperationTimeout 180000
+            $data = Invoke-Command -ComputerName $dc.HostName -ScriptBlock $DcProbe -ArgumentList (, $RegList) -SessionOption $so -ErrorAction Stop
+            $method = 'WinRM'
         }
     } catch {
-        $node.Error = $_.Exception.Message
-        $FolderErrors.Add([pscustomobject][ordered]@{ 'Percorso' = $Path; 'Errore' = $_.Exception.Message })
-    }
-    if (-not $NoRecurse -and $Level -lt $FolderDepth) {
+        $probeErr = $_.Exception.Message
         try {
-            $di = New-Object System.IO.DirectoryInfo -ArgumentList $Path
-            $subs = @($di.GetDirectories() | Sort-Object Name)
-            foreach ($s in $subs) {
-                if ($script:FolderCount -ge $MaxFolders) { $node.Truncated = $true; $script:FolderTruncated = $true; break }
-                $isReparse = ($s.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
-                $child = Get-FolderAclNode -Path $s.FullName -Level ($Level + 1) -NoRecurse $isReparse
-                if ($isReparse) { $child.Note = 'Collegamento / junction: non esplorato' }
-                $node.Children.Add($child)
-            }
-        } catch {
-            $msg = "Impossibile elencare le sottocartelle: $($_.Exception.Message)"
-            if (-not $node.Error) { $node.Error = $msg }
-            $FolderErrors.Add([pscustomobject][ordered]@{ 'Percorso' = $Path; 'Errore' = $msg })
-        }
-    }
-    return $node
-}
-
-function ConvertTo-FolderTreeHtml {
-    param($Node)
-    $isRoot = $Node.Level -eq 0
-    $childSb = New-Object System.Text.StringBuilder
-    $childSpecial = $false
-    foreach ($ch in $Node.Children) {
-        $r = ConvertTo-FolderTreeHtml $ch
-        [void]$childSb.Append($r.Html)
-        if ($r.Special) { $childSpecial = $true }
-    }
-    $selfSpecial = [bool]($Node.Protected -or $Node.Risky -or $Node.Error -or (-not $isRoot -and $Node.ExplicitCount -gt 0))
-    $special = $selfSpecial -or $childSpecial -or $isRoot
-    $b = New-Object System.Collections.Generic.List[string]
-    if ($Node.Protected -and -not $isRoot) { $b.Add("<span class='bdg b-med'>Ereditarietà disabilitata</span>") }
-    if ($Node.ExplicitCount -gt 0 -and -not $isRoot) { $b.Add("<span class='bdg b-info'>$($Node.ExplicitCount) ACE esplicite</span>") }
-    if ($Node.Risky) { $b.Add("<span class='bdg b-high'>Permessi ampi in scrittura</span>") }
-    if ($Node.Error) { $b.Add("<span class='bdg b-high'>Errore</span>") }
-    if ($Node.Note -and -not $Node.Protected) { $b.Add("<span class='bdg b-off'>$(Enc $Node.Note)</span>") }
-    if ($Node.Truncated) { $b.Add("<span class='bdg b-off'>Limite cartelle raggiunto</span>") }
-    $showAces = if ($isRoot -or $IncludeInheritedAces) { @($Node.Aces) } else { @($Node.Aces | Where-Object { -not $_.Inherited }) }
-    $inhCount = @($Node.Aces | Where-Object { $_.Inherited }).Count
-    $body = New-Object System.Text.StringBuilder
-    [void]$body.Append("<div class='node'><div><code>$(Enc $Node.Path)</code></div><div>Proprietario: <b>$(Enc $Node.Owner)</b></div>")
-    if ($Node.Error) { [void]$body.Append("<div class='err'>$(Enc $Node.Error)</div>") }
-    if ($showAces.Count) {
-        [void]$body.Append("<table class='mini'><tr><th>Identità</th><th>Tipo</th><th>Diritti</th><th>Si applica a</th><th>Ereditata</th></tr>")
-        foreach ($a in $showAces) {
-            $rc = @()
-            if (-not $a.Allow) { $rc += 'ace-deny' }
-            if ($a.Risky) { $rc += 'ace-risk' }
-            if ($a.Inherited) { $rc += 'ace-inh' }
-            [void]$body.Append("<tr class='$($rc -join ' ')'><td>$(Enc $a.Identity)$(if ($a.Orphan) { " <span class='bdg b-low'>SID orfano</span>" })</td><td>$(if ($a.Allow) { 'Consenti' } else { "<span class='bdg b-high'>Nega</span>" })</td><td>$(Enc $a.Rights)</td><td>$(Enc $a.AppliesTo)</td><td>$(if ($a.Inherited) { 'Sì' } else { '<b>No</b>' })</td></tr>")
-        }
-        [void]$body.Append('</table>')
-    }
-    if (-not $isRoot -and -not $IncludeInheritedAces -and $inhCount -gt 0) { [void]$body.Append("<div class='empty'>$inhCount ACE ereditate non mostrate (identiche alla cartella superiore).</div>") }
-    [void]$body.Append('</div>')
-    $open = if ($isRoot) { ' open' } else { '' }
-    $html = "<li class='fnode' data-x='$([int]$special)'><details$open><summary>&#128193; $(Enc $Node.Name) $($b -join ' ')</summary>$($body.ToString())"
-    if ($Node.Children.Count) { $html += "<ul>$($childSb.ToString())</ul>" }
-    $html += '</details></li>'
-    return [pscustomobject]@{ Html = $html; Special = $special }
-}
-
-$ShareRows = New-Object System.Collections.Generic.List[object]
-if (-not $SkipFolderReport -and $FolderPath) {
-    $treeIdx = 0
-    foreach ($fp in $FolderPath) {
-        $treeIdx++
-        Write-Step "Analisi permessi: $fp (profondità $FolderDepth)"
-        if (-not (Test-Path -LiteralPath $fp -PathType Container)) {
-            Add-Log 'Permessi cartelle' "Percorso non trovato o non accessibile: $fp"
-            $FolderSections.Add("<h3>$(Enc $fp)</h3><p class='err'>Percorso non trovato o non accessibile.</p>")
-            continue
-        }
-        if ($fp -match '^\\\\([^\\]+)\\([^\\]+)') {
-            $srv = $matches[1]; $share = $matches[2]
+            $data = [pscustomobject]@{ Reg = (Get-RemoteRegValues -Computer $dc.HostName -RegList $RegList); Spooler = $null; Smb = $null; Zones = @(); Ev2887 = $null; CredGuard = $null }
+            $method = 'Registro remoto (WinRM non disponibile)'
             try {
-                foreach ($sa in (Get-SmbShareAccess -Name $share -CimSession $srv -ErrorAction Stop)) {
-                    $ShareRows.Add([pscustomobject][ordered]@{ 'Condivisione' = "\\$srv\$share"; 'Account' = $sa.AccountName; 'Tipo' = [string]$sa.AccessControlType; 'Diritto' = [string]$sa.AccessRight })
-                    if ([string]$sa.AccessControlType -eq 'Allow' -and [string]$sa.AccessRight -in 'Full', 'Change' -and $sa.AccountName -match '^(Everyone|Tutti|Jeder|Tout le monde)$') { Add-FL 'fs.share.everyone' "\\$srv\$share - $($sa.AccountName): $($sa.AccessRight)" }
-                }
-            } catch { Add-Log 'Permessi condivisione' "\\$srv\$($share): $($_.Exception.Message)" 'Info' }
+                $cs = New-CimSession -ComputerName $dc.HostName -SessionOption (New-CimSessionOption -Protocol Dcom) -ErrorAction Stop
+                try { $sv = Get-CimInstance -CimSession $cs -ClassName Win32_Service -Filter "Name='Spooler'" -ErrorAction Stop; if ($sv) { $data.Spooler = "$($sv.State) / $($sv.StartMode)" } } finally { Remove-CimSession $cs }
+            } catch { }
+        } catch {
+            $method = 'Non raggiungibile'
+            $probeErr = "$probeErr | Registro remoto: $($_.Exception.Message)"
+            $data = $null
         }
-        $countBefore = $script:FolderCount
-        $root = Get-FolderAclNode -Path $fp -Level 0 -NoRecurse $false
-        $analyzed = $script:FolderCount - $countBefore
-        $tid = "ftree$treeIdx"
-        $tree = (ConvertTo-FolderTreeHtml $root).Html
-        $FolderSections.Add(@"
-<h3>&#128194; $(Enc $fp)</h3>
-<p class='intro'>Cartelle analizzate: <b>$analyzed</b> &middot; Profondità massima: <b>$FolderDepth</b> &middot; Proprietario radice: <b>$(Enc $root.Owner)</b></p>
-<div class='tb'><button type='button' onclick="treeAll('$tid',true)">Espandi tutto</button><button type='button' onclick="treeAll('$tid',false)">Comprimi tutto</button>
-<label><input type='checkbox' onchange="treeX('$tid',this)"> Mostra solo cartelle con eccezioni (permessi espliciti, ereditarietà disabilitata, rischi, errori)</label></div>
-<ul class='tree' id='$tid'>$tree</ul>
-"@)
     }
-    Write-Progress -Activity 'Analisi permessi cartelle' -Completed
+    $DcProbeStatus.Add([pscustomobject][ordered]@{ 'Domain Controller' = $dcName; 'Metodo di raccolta' = $method; 'Errore' = $probeErr })
+    if (-not $data) {
+        Add-FL 'proto.unreachable' "$dcName - $probeErr"
+        continue
+    }
+    $reg = $data.Reg
+
+
+    # LDAP signing
+    $v = Get-DcRegValue 'LDAPServerIntegrity'
+    if ($null -eq $v) { Add-ProtoRow $dcName 'LDAP' 'Firma LDAP richiesta dal server (LDAPServerIntegrity)' $(if (& $IsWin2025 $os) { 'Non impostato (predefinito SO 2025: verificare GPO)' } else { 'Non impostato (predefinito: nessuna firma obbligatoria)' }) '2 = Richiedi firma' $(if (& $IsWin2025 $os) { 'Info' } else { 'Attenzione' }) 'proto.ldapsign' }
+    else { Add-ProtoRow $dcName 'LDAP' 'Firma LDAP richiesta dal server (LDAPServerIntegrity)' $(switch ([int]$v) { 0 { '0 = Nessuna' } 1 { '1 = Negozia (non obbligatoria)' } 2 { '2 = Richiedi firma' } default { "$v" } }) '2 = Richiedi firma' $(if ([int]$v -ge 2) { 'OK' } elseif ([int]$v -eq 0) { 'Critico' } else { 'Attenzione' }) 'proto.ldapsign' }
+    # Channel binding
+    $v = Get-DcRegValue 'LdapEnforceChannelBinding'
+    $cbTxt = switch ("$v") { '' { 'Non impostato (predefinito: mai, sulle versioni precedenti a 2025)' } '0' { '0 = Mai' } '1' { '1 = Quando supportato' } '2' { '2 = Sempre' } default { "$v" } }
+    Add-ProtoRow $dcName 'LDAP' 'Channel binding LDAPS (LdapEnforceChannelBinding)' $cbTxt '2 = Sempre (dopo verifica client), almeno 1' $(if ("$v" -eq '2') { 'OK' } elseif ("$v" -eq '1') { 'Info' } else { 'Attenzione' }) 'proto.cbt'
+    # Evento 2887: bind non firmati / in chiaro nelle ultime 24 ore
+    if ($data.Ev2887) {
+        $e = $data.Ev2887
+        $txt = "Bind semplici in chiaro: $($e.Simple) - Bind SASL senza firma: $($e.Sasl) (evento del $(Format-Date $e.Time))"
+        $bad = ([int]$e.Simple + [int]$e.Sasl) -gt 0
+        Add-ProtoRow $dcName 'LDAP' 'Client con bind LDAP non sicuri (evento 2887)' $txt '0 bind non firmati / in chiaro' $(if ($bad) { 'Attenzione' } else { 'OK' }) 'proto.unsignedbinds'
+    } elseif ($method -ne 'Registro remoto (WinRM non disponibile)') {
+        Add-ProtoRow $dcName 'LDAP' 'Client con bind LDAP non sicuri (evento 2887)' 'Nessun evento 2887 recente (nessun bind non sicuro, oppure firma già imposta)' '0 bind non firmati / in chiaro' 'OK'
+    }
+
+    # NTLM / LM
+    $v = Get-DcRegValue 'LmCompatibilityLevel'
+    $lm = if ($null -eq $v) { 3 } else { [int]$v }
+    Add-ProtoRow $dcName 'NTLM' 'Livello autenticazione LAN Manager (LmCompatibilityLevel)' $(if ($null -eq $v) { 'Non impostato (predefinito 3: il DC accetta LM/NTLMv1)' } else { "$lm" }) '5 = Invia solo NTLMv2, rifiuta LM e NTLM' $(if ($lm -ge 5) { 'OK' } elseif ($lm -ge 3) { 'Attenzione' } else { 'Critico' }) 'proto.ntlmv1'
+    $v = Get-DcRegValue 'NoLMHash'
+    Add-ProtoRow $dcName 'NTLM' 'Non memorizzare hash LM (NoLMHash)' $(if ($null -eq $v) { 'Non impostato (predefinito 1)' } else { "$v" }) '1' $(if ($null -eq $v -or [int]$v -eq 1) { 'OK' } else { 'Critico' }) 'proto.lmhash'
+    $v = Get-DcRegValue 'NtlmMinServerSec'
+    $ms = if ($null -eq $v) { 536870912 } else { [int64]$v }
+    Add-ProtoRow $dcName 'NTLM' 'Sicurezza minima sessioni NTLM server (NtlmMinServerSec)' $(if ($null -eq $v) { 'Non impostato (predefinito: 128 bit, senza NTLMv2 obbligatorio)' } else { '0x{0:X}' -f $ms }) '0x20080000 = NTLMv2 + 128 bit' $(if (($ms -band 0x20080000) -eq 0x20080000) { 'OK' } else { 'Attenzione' }) 'proto.ntlmminsec'
+    $vA = Get-DcRegValue 'AuditNTLMInDomain'; $vR = Get-DcRegValue 'RestrictNTLMInDomain'; $vAr = Get-DcRegValue 'AuditReceivingNTLMTraffic'
+    $auditOn = ($null -ne $vA -and [int]$vA -gt 0) -or ($null -ne $vAr -and [int]$vAr -gt 0)
+    Add-ProtoRow $dcName 'NTLM' 'Audit dell''uso di NTLM (AuditNTLMInDomain / AuditReceivingNTLMTraffic)' $(if ($auditOn) { "AuditNTLMInDomain=$vA; AuditReceivingNTLMTraffic=$vAr" } else { 'Non attivo' }) 'Audit attivo (7 / 2) per individuare l''uso residuo di NTLM' $(if ($auditOn) { 'OK' } else { 'Attenzione' }) 'proto.ntlmaudit'
+    Add-ProtoRow $dcName 'NTLM' 'Restrizione NTLM nel dominio (RestrictNTLMInDomain)' $(if ($null -eq $vR -or [int]$vR -eq 0) { 'Non attiva (NTLM consentito)' } else { "$vR" }) 'Valutare la restrizione dopo l''analisi dei log di audit' 'Info'
+
+    # Accessi anonimi
+    $v = Get-DcRegValue 'RestrictAnonymous'
+    Add-ProtoRow $dcName 'Accesso anonimo' 'Enumerazione anonima di account e condivisioni (RestrictAnonymous)' $(if ($null -eq $v) { 'Non impostato (0)' } else { "$v" }) '1' $(if ($null -ne $v -and [int]$v -ge 1) { 'OK' } else { 'Attenzione' }) 'proto.anon'
+    $v = Get-DcRegValue 'RestrictAnonymousSAM'
+    Add-ProtoRow $dcName 'Accesso anonimo' 'Enumerazione anonima account SAM (RestrictAnonymousSAM)' $(if ($null -eq $v) { 'Non impostato (predefinito 1)' } else { "$v" }) '1' $(if ($null -eq $v -or [int]$v -eq 1) { 'OK' } else { 'Critico' }) 'proto.anon'
+    $v = Get-DcRegValue 'EveryoneIncludesAnonymous'
+    Add-ProtoRow $dcName 'Accesso anonimo' 'Everyone include gli anonimi (EveryoneIncludesAnonymous)' $(if ($null -eq $v) { 'Non impostato (predefinito 0)' } else { "$v" }) '0' $(if ($null -eq $v -or [int]$v -eq 0) { 'OK' } else { 'Critico' }) 'proto.anon'
+
+    # SMB
+    if ($data.Smb) {
+        Add-ProtoRow $dcName 'SMB' 'Firma SMB obbligatoria (server)' $(if ($data.Smb.RequireSign) { 'Sì' } else { 'No' }) 'Sì' $(if ($data.Smb.RequireSign) { 'OK' } else { 'Critico' }) 'proto.smbsign'
+        Add-ProtoRow $dcName 'SMB' 'Protocollo SMBv1 (server)' $(if ($data.Smb.SMB1) { 'Abilitato' } else { 'Disabilitato' }) 'Disabilitato' $(if ($data.Smb.SMB1) { 'Critico' } else { 'OK' }) 'proto.smb1'
+        Add-ProtoRow $dcName 'SMB' 'Crittografia SMB obbligatoria' $(if ($data.Smb.Encrypt) { 'Sì' } else { 'No' }) 'Facoltativa (consigliata dove supportata)' 'Info'
+    } else {
+        $v = Get-DcRegValue 'RequireSecuritySignature' 'LanmanServer'
+        if ($null -ne $v) { Add-ProtoRow $dcName 'SMB' 'Firma SMB obbligatoria (server)' "$v" '1' $(if ([int]$v -eq 1) { 'OK' } else { 'Critico' }) 'proto.smbsign' }
+        else { Add-ProtoRow $dcName 'SMB' 'Firma SMB obbligatoria (server)' 'Non determinabile' '1' 'N/D' }
+        $v = Get-DcRegValue 'SMB1' 'LanmanServer'
+        Add-ProtoRow $dcName 'SMB' 'Protocollo SMBv1 (server)' $(if ($null -eq $v) { 'Non determinabile (valore non impostato)' } else { "$v" }) '0 / disabilitato' $(if ($null -eq $v) { 'N/D' } elseif ([int]$v -eq 0) { 'OK' } else { 'Critico' }) 'proto.smb1'
+    }
+
+    # TLS / SChannel
+    foreach ($pn in 'SSL 3.0', 'TLS 1.0', 'TLS 1.1') {
+        $v = Get-DcRegValue 'Enabled' "\$pn\Server"
+        $default = if ($pn -eq 'SSL 3.0') { 'Non impostato (disabilitato per impostazione predefinita)' } elseif (& $IsWin2025 $os) { 'Non impostato (predefinito del SO)' } else { 'Non impostato (abilitato per impostazione predefinita)' }
+        $res = if ($null -ne $v) { if ([int]$v -eq 0) { 'OK' } elseif ($pn -eq 'SSL 3.0') { 'Critico' } else { 'Attenzione' } } elseif ($pn -eq 'SSL 3.0' -or (& $IsWin2025 $os)) { 'Info' } else { 'Attenzione' }
+        Add-ProtoRow $dcName 'TLS' "$pn lato server (SCHANNEL)" $(if ($null -eq $v) { $default } elseif ([int]$v -eq 0) { 'Disabilitato' } else { 'Abilitato' }) 'Disabilitato' $res 'proto.tlslegacy'
+    }
+
+    # Kerberos
+    $v = Get-DcRegValue 'SupportedEncryptionTypes'
+    $kRes = if ($null -eq $v) { 'Attenzione' } elseif ([int64]$v -band 3) { 'Critico' } elseif ([int64]$v -band 4) { 'Attenzione' } else { 'OK' }
+    Add-ProtoRow $dcName 'Kerberos' 'Tipi di crittografia consentiti (criterio SupportedEncryptionTypes)' $(if ($null -eq $v) { 'Non configurato (RC4 consentito)' } else { Format-EncTypes $v }) 'Solo AES128 / AES256 (0x18) dopo verifica compatibilità' $kRes 'proto.rc4'
+
+    # Netlogon (Zerologon) e canale sicuro
+    $v = Get-DcRegValue 'VulnerableChannelAllowList'
+    if ($null -ne $v -and "$v" -ne '') { Add-ProtoRow $dcName 'Netlogon' 'Eccezioni canale sicuro vulnerabile (VulnerableChannelAllowList)' "$v" 'Non impostato' 'Critico' 'proto.netlogon' }
+    else { Add-ProtoRow $dcName 'Netlogon' 'Eccezioni canale sicuro vulnerabile (VulnerableChannelAllowList)' 'Non impostato' 'Non impostato' 'OK' }
+    $v = Get-DcRegValue 'RequireSignOrSeal'
+    Add-ProtoRow $dcName 'Netlogon' 'Firma/crittografia canale sicuro obbligatoria (RequireSignOrSeal)' $(if ($null -eq $v) { 'Non impostato (predefinito 1)' } else { "$v" }) '1' $(if ($null -eq $v -or [int]$v -eq 1) { 'OK' } else { 'Critico' }) 'proto.netlogon'
+    $v = Get-DcRegValue 'RequireStrongKey'
+    Add-ProtoRow $dcName 'Netlogon' 'Chiave di sessione avanzata (RequireStrongKey)' $(if ($null -eq $v) { 'Non impostato (predefinito 1)' } else { "$v" }) '1' $(if ($null -eq $v -or [int]$v -eq 1) { 'OK' } else { 'Attenzione' }) 'proto.netlogon'
+
+    # Protezione credenziali
+    $v = Get-DcRegValue 'UseLogonCredential'
+    Add-ProtoRow $dcName 'Credenziali' 'WDigest: password in chiaro in memoria (UseLogonCredential)' $(if ($null -eq $v) { 'Non impostato (predefinito 0)' } else { "$v" }) '0' $(if ($null -eq $v -or [int]$v -eq 0) { 'OK' } else { 'Critico' }) 'proto.wdigest'
+    $v = Get-DcRegValue 'RunAsPPL'
+    Add-ProtoRow $dcName 'Credenziali' 'Protezione LSA - LSASS come processo protetto (RunAsPPL)' $(if ($null -eq $v) { 'Non impostato' } else { "$v" }) '1 o 2' $(if ($null -ne $v -and [int]$v -ge 1) { 'OK' } else { 'Attenzione' }) 'proto.ppl'
+    if ($null -ne $data.CredGuard) { Add-ProtoRow $dcName 'Credenziali' 'Credential Guard in esecuzione' $(if ($data.CredGuard) { 'Sì' } else { 'No' }) 'Informativo (sui DC non protegge il database NTDS)' 'Info' }
+
+    # Servizi e risoluzione nomi
+    if ($data.Spooler) {
+        $running = $data.Spooler -match '^Running'
+        Add-ProtoRow $dcName 'Servizi' 'Servizio Print Spooler' $data.Spooler 'Arrestato e disabilitato' $(if ($running) { 'Critico' } elseif ($data.Spooler -notmatch 'Disabled') { 'Attenzione' } else { 'OK' }) 'proto.spooler'
+    } else { Add-ProtoRow $dcName 'Servizi' 'Servizio Print Spooler' 'Non determinabile' 'Arrestato e disabilitato' 'N/D' }
+    $v = Get-DcRegValue 'EnableMulticast'
+    Add-ProtoRow $dcName 'Risoluzione nomi' 'LLMNR (criterio EnableMulticast)' $(if ($null -eq $v) { 'Non configurato (LLMNR attivo)' } else { "$v" }) '0 = disattivato (via GPO su tutti i computer)' $(if ($null -ne $v -and [int]$v -eq 0) { 'OK' } else { 'Attenzione' }) 'proto.llmnr'
+
+    # Sincronizzazione oraria (solo emulatore PDC)
+    if ($dc.HostName -eq $Domain.PDCEmulator) {
+        $tt = [string](Get-DcRegValue 'Type'); $ntp = [string](Get-DcRegValue 'NtpServer')
+        Add-ProtoRow $dcName 'Ora' 'Sorgente oraria dell''emulatore PDC (W32Time)' "Type=$tt; NtpServer=$ntp" 'Type=NTP con sorgente esterna affidabile' $(if ($tt -eq 'NTP') { 'OK' } else { 'Attenzione' }) 'proto.time'
+    }
+
+    # Zone DNS
+    foreach ($z in @($data.Zones)) {
+        if (-not $z -or $ZoneSeen.ContainsKey($z.Zone)) { continue }
+        $ZoneSeen[$z.Zone] = $true
+        $insecure = $z.DynamicUpdate -eq 'NonsecureAndSecure'
+        if ($insecure) { Add-FL 'proto.dnsupdate' "$($z.Zone) (letta da $dcName)" }
+        $DnsZoneRows.Add([pscustomobject][ordered]@{
+                'Zona' = $z.Zone; 'Tipo' = $(if ($z.Reverse) { 'Inversa' } else { 'Diretta' }); 'Integrata in AD' = $z.DsIntegrated
+                'Aggiornamenti dinamici' = $(switch ($z.DynamicUpdate) { 'Secure' { New-Badge 'Solo sicuri' 'b-ok' } 'NonsecureAndSecure' { New-Badge 'Non sicuri e sicuri' 'b-high' } 'None' { 'Nessuno' } default { $z.DynamicUpdate } })
+                'Letta da' = $dcName
+            })
+    }
+}
+
+# ---- Controlli a livello di dominio (LDAP) ----
+Write-Step 'Controlli di sicurezza a livello di dominio (ACL, dsHeuristics, AD CS, GPP)'
+
+function Add-DomainHardRow {
+    param([string]$Setting, $Value, [string]$Recommended, [ValidateSet('OK', 'Attenzione', 'Critico', 'Info')][string]$Result)
+    $cls = switch ($Result) { 'OK' { 'b-ok' } 'Attenzione' { 'b-med' } 'Critico' { 'b-high' } default { 'b-info' } }
+    $DomainHardRows.Add([pscustomobject][ordered]@{ 'Impostazione' = $Setting; 'Valore attuale' = $Value; 'Valore consigliato' = $Recommended; 'Esito' = (New-Badge $Result $cls) })
+}
+
+# dsHeuristics: 7° carattere = 2 abilita le operazioni LDAP anonime
+$anonOps = ($DsHeuristics.Length -ge 7 -and $DsHeuristics[6] -eq '2')
+if ($anonOps) { Add-FL 'dom.dsheur' "dSHeuristics = $DsHeuristics" }
+Add-DomainHardRow 'dSHeuristics (operazioni LDAP anonime)' $(if ($DsHeuristics) { $DsHeuristics } else { 'Non impostato' }) '7° carattere diverso da 2' $(if ($anonOps) { 'Critico' } else { 'OK' })
+
+# Crittografia Kerberos di krbtgt e degli account dei DC
+$krb = $RawUsers | Where-Object { $_.SID.Value -eq "$DomainSID-502" } | Select-Object -First 1
+if ($krb) { Add-DomainHardRow 'Crittografia supportata da krbtgt (msDS-SupportedEncryptionTypes)' (Format-EncTypes $krb.'msDS-SupportedEncryptionTypes') 'AES (eventualmente impostato esplicitamente a 0x18)' 'Info' }
+foreach ($c in ($RawComputers | Where-Object { $_.PrimaryGroupID -in 516, 521 } | Sort-Object Name)) {
+    $et = $c.'msDS-SupportedEncryptionTypes'
+    $res = if ($null -eq $et -or [int]$et -eq 0) { 'Info' } elseif ([int]$et -band 3) { 'Critico' } elseif ([int]$et -band 4) { 'Attenzione' } else { 'OK' }
+    Add-DomainHardRow "Crittografia supportata dall'account del DC $($c.Name)" (Format-EncTypes $et) 'Solo AES (0x18)' $res
+}
+
+# Permessi critici sulla radice del dominio e su AdminSDHolder (DCSync / modifica ACL)
+$GuidGetChanges = '1131f6aa-9c07-11d1-f79f-00c04fc2dcd2'
+$GuidGetChangesAll = '1131f6ad-9c07-11d1-f79f-00c04fc2dcd2'
+$TrustedAclSids = @('S-1-5-18', 'S-1-5-9', 'S-1-5-32-544', "$DomainSID-512", "$DomainSID-516", "$RootDomainSID-519", "$RootDomainSID-498", "$DomainSID-521", 'S-1-3-0', 'S-1-5-10')
+foreach ($target in @(@{ DN = $DomainDN; Label = "Radice del dominio ($DnsRoot)" }, @{ DN = "CN=AdminSDHolder,CN=System,$DomainDN"; Label = 'AdminSDHolder' })) {
+    $obj = Invoke-Safe "ACL $($target.Label)" { Get-ADObject -Identity $target.DN -Properties nTSecurityDescriptor @adParams -ErrorAction Stop }
+    if (-not $obj -or -not $obj.nTSecurityDescriptor) { continue }
+    foreach ($ace in $obj.nTSecurityDescriptor.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+        if ([string]$ace.AccessControlType -ne 'Allow') { continue }
+        $sid = $ace.IdentityReference.Value
+        if ($TrustedAclSids -contains $sid) { continue }
+        $rights = [System.DirectoryServices.ActiveDirectoryRights]$ace.ActiveDirectoryRights
+        $ot = ([guid]$ace.ObjectType).ToString()
+        $issues = @()
+        if ($rights -band [System.DirectoryServices.ActiveDirectoryRights]::GenericAll) { $issues += 'Controllo completo' }
+        if ($rights -band [System.DirectoryServices.ActiveDirectoryRights]::WriteDacl) { $issues += 'Modifica autorizzazioni (WriteDacl)' }
+        if ($rights -band [System.DirectoryServices.ActiveDirectoryRights]::WriteOwner) { $issues += 'Modifica proprietario (WriteOwner)' }
+        if (($rights -band [System.DirectoryServices.ActiveDirectoryRights]::WriteProperty) -and $ot -eq '00000000-0000-0000-0000-000000000000') { $issues += 'Scrittura di tutte le proprietà' }
+        if ($target.DN -eq $DomainDN -and ($rights -band [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight)) {
+            if ($ot -eq $GuidGetChangesAll) { $issues += 'Replica di tutte le modifiche (DCSync)' }
+            elseif ($ot -eq '00000000-0000-0000-0000-000000000000') { $issues += 'Tutti i diritti estesi (incluso DCSync)' }
+            elseif ($ot -eq $GuidGetChanges) { $issues += 'Replica modifiche directory' }
+        }
+        if (-not $issues.Count) { continue }
+        $name = Resolve-SidName $sid
+        $who = if ($name) { "$name ($sid)" } else { "$sid (non risolto)" }
+        $isDcSync = [bool]($issues | Where-Object { $_ -match 'DCSync' })
+        $onlyGetChanges = ($issues.Count -eq 1 -and $issues[0] -eq 'Replica modifiche directory')
+        if ($onlyGetChanges) { continue }
+        if ($isDcSync) { Add-FL 'dom.dcsync' "$who - $($target.Label)" } else { Add-FL 'dom.rootacl' "$who - $($target.Label): $($issues -join ', ')" }
+        $AclRiskRows.Add([pscustomobject][ordered]@{
+                'Oggetto' = $target.Label; 'Principale' = $who; 'Diritti' = @($issues)
+                'Ereditata' = [bool]$ace.IsInherited
+                'Gravità' = $(if ($isDcSync) { New-Badge 'Critico' 'b-crit' } else { New-Badge 'Alto' 'b-high' })
+            })
+    }
+}
+
+# Password Group Policy Preferences (cpassword) in SYSVOL
+try {
+    $gppFiles = @(Get-ChildItem -LiteralPath $SysvolPolicies -Recurse -File -Include 'Groups.xml', 'Services.xml', 'ScheduledTasks.xml', 'DataSources.xml', 'Printers.xml', 'Drives.xml' -ErrorAction SilentlyContinue)
+    foreach ($gf in $gppFiles) {
+        $hit = Select-String -LiteralPath $gf.FullName -Pattern 'cpassword="([^"]+)"' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($hit) {
+            $guid = ([regex]::Match($gf.FullName, '\{[0-9A-Fa-f\-]{36}\}')).Value.ToUpper()
+            $gpoName = Get-GpoName $guid
+            Add-FL 'dom.gpp' "$gpoName - $($gf.FullName)"
+            $GppRows.Add([pscustomobject][ordered]@{ 'GPO' = $gpoName; 'File' = $gf.FullName; 'Tipo' = $gf.BaseName })
+        }
+    }
+} catch { Add-Log 'GPP' $_.Exception.Message 'Info' }
+
+# AD CS: modelli di certificato pubblicati e potenzialmente vulnerabili (ESC1 / ESC2 / ESC3 / ESC4)
+$PkiBase = "CN=Public Key Services,CN=Services,$ConfigNC"
+$CAs = @(Invoke-Safe 'AD CS' { Get-ADObject -SearchBase "CN=Enrollment Services,$PkiBase" -LDAPFilter '(objectClass=pKIEnrollmentService)' -Properties dNSHostName, certificateTemplates, displayName @adParams -ErrorAction Stop } | Where-Object { $_ })
+if ($CAs.Count) {
+    $published = @{}
+    foreach ($ca in $CAs) { foreach ($tn in @(Get-List $ca.certificateTemplates)) { if (-not $published.ContainsKey($tn)) { $published[$tn] = New-Object System.Collections.Generic.List[string] }; $published[$tn].Add($ca.Name) } }
+    $tpls = @(Invoke-Safe 'Modelli certificato' { Get-ADObject -SearchBase "CN=Certificate Templates,$PkiBase" -LDAPFilter '(objectClass=pKICertificateTemplate)' -Properties name, displayName, 'msPKI-Certificate-Name-Flag', 'msPKI-Enrollment-Flag', 'msPKI-RA-Signature', pKIExtendedKeyUsage, 'msPKI-Certificate-Application-Policy', nTSecurityDescriptor @adParams -ErrorAction Stop } | Where-Object { $_ })
+    $BroadEnrollSids = @('S-1-1-0', 'S-1-5-7', 'S-1-5-11', 'S-1-5-32-545', "$DomainSID-513", "$DomainSID-515")
+    $AuthEkus = @('1.3.6.1.5.5.7.3.2', '1.3.6.1.4.1.311.20.2.2', '1.3.6.1.5.2.3.4', '2.5.29.37.0')
+    $EnrollGuids = @('0e10c968-78fb-11d2-90d4-00c04f79dc55', 'a05b8cc2-17bc-4802-a710-e7c15ab866a2')
+    foreach ($t in ($tpls | Sort-Object Name)) {
+        if (-not $published.ContainsKey($t.Name)) { continue }
+        $ekus = @(@(Get-List $t.pKIExtendedKeyUsage) + @(Get-List $t.'msPKI-Certificate-Application-Policy') | Select-Object -Unique)
+        $nameFlag = [int64]$t.'msPKI-Certificate-Name-Flag'
+        $enrFlag = [int64]$t.'msPKI-Enrollment-Flag'
+        $raSig = [int]$t.'msPKI-RA-Signature'
+        $approval = ($enrFlag -band 2) -ne 0
+        $suppliesSubject = ($nameFlag -band 1) -ne 0
+        $broadEnroll = New-Object System.Collections.Generic.List[string]
+        $broadWrite = New-Object System.Collections.Generic.List[string]
+        if ($t.nTSecurityDescriptor) {
+            foreach ($ace in $t.nTSecurityDescriptor.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+                if ([string]$ace.AccessControlType -ne 'Allow') { continue }
+                $sid = $ace.IdentityReference.Value
+                if ($BroadEnrollSids -notcontains $sid) { continue }
+                $r = [System.DirectoryServices.ActiveDirectoryRights]$ace.ActiveDirectoryRights
+                $ot = ([guid]$ace.ObjectType).ToString()
+                $nm = Resolve-SidName $sid; if (-not $nm) { $nm = $sid }
+                if (($r -band [System.DirectoryServices.ActiveDirectoryRights]::GenericAll) -or ($r -band [System.DirectoryServices.ActiveDirectoryRights]::WriteDacl) -or ($r -band [System.DirectoryServices.ActiveDirectoryRights]::WriteOwner) -or (($r -band [System.DirectoryServices.ActiveDirectoryRights]::WriteProperty) -and $ot -eq '00000000-0000-0000-0000-000000000000')) { if (-not $broadWrite.Contains($nm)) { $broadWrite.Add($nm) } }
+                if (($r -band [System.DirectoryServices.ActiveDirectoryRights]::GenericAll) -or (($r -band [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight) -and ($EnrollGuids -contains $ot -or $ot -eq '00000000-0000-0000-0000-000000000000'))) { if (-not $broadEnroll.Contains($nm)) { $broadEnroll.Add($nm) } }
+            }
+        }
+        $esc = @()
+        $authCapable = ($ekus.Count -eq 0) -or [bool]($ekus | Where-Object { $AuthEkus -contains $_ })
+        if ($broadEnroll.Count -and -not $approval -and $raSig -eq 0) {
+            if ($suppliesSubject -and $authCapable) { $esc += 'ESC1'; Add-FL 'adcs.esc1' "$($t.Name) - enrollment: $($broadEnroll -join ', ')" }
+            if ($ekus.Count -eq 0 -or $ekus -contains '2.5.29.37.0') { $esc += 'ESC2'; Add-FL 'adcs.esc2' "$($t.Name) - enrollment: $($broadEnroll -join ', ')" }
+            if ($ekus -contains '1.3.6.1.4.1.311.20.2.1') { $esc += 'ESC3'; Add-FL 'adcs.esc2' "$($t.Name) (Certificate Request Agent) - enrollment: $($broadEnroll -join ', ')" }
+        }
+        if ($broadWrite.Count) { $esc += 'ESC4'; Add-FL 'adcs.esc4' "$($t.Name) - scrittura: $($broadWrite -join ', ')" }
+        $AdcsRows.Add([pscustomobject][ordered]@{
+                'Modello' = $t.Name; 'Nome visualizzato' = $t.displayName; 'Pubblicato su' = @($published[$t.Name])
+                'Soggetto fornito dal richiedente' = Get-Flag $suppliesSubject 'b-med'
+                'Approvazione manager' = $approval; 'Firme autorizzate richieste' = $raSig
+                'EKU' = $(if ($ekus.Count) { $ekus } else { '(nessuna: qualsiasi scopo)' })
+                'Enrollment gruppi ampi' = @($broadEnroll); 'Scrittura gruppi ampi' = @($broadWrite)
+                'Problemi' = @($esc | ForEach-Object { New-Badge $_ 'b-high' })
+                '_RowClass' = $(if ($esc.Count) { 'f-issue' } else { '' })
+            })
+    }
 }
 
 #endregion
@@ -1742,6 +2040,7 @@ if (-not $SkipFolderReport -and $FolderPath) {
 #region ===================== EVENTI DI SICUREZZA (opzionale) =====================
 
 $EventAgg = @{}
+$NtlmV1Agg = @{}
 $LockoutRows = New-Object System.Collections.Generic.List[object]
 $StatusMap = @{
     '0xc000006a' = 'Password errata'; '0xc0000064' = 'Utente inesistente'; '0xc000006d' = 'Credenziali errate'; '0xc000006e' = 'Restrizione account'
@@ -1756,7 +2055,8 @@ if ($IncludeSecurityEvents) {
     $ms = [int64]$EventHours * 3600000
     $queries = @(
         "*[System[(EventID=4625 or EventID=4771 or EventID=4740) and TimeCreated[timediff(@SystemTime) <= $ms]]]",
-        "*[System[(EventID=4776) and TimeCreated[timediff(@SystemTime) <= $ms]] and EventData[Data[@Name='Status']!='0x0']]"
+        "*[System[(EventID=4776) and TimeCreated[timediff(@SystemTime) <= $ms]] and EventData[Data[@Name='Status']!='0x0']]",
+        "*[System[(EventID=4624) and TimeCreated[timediff(@SystemTime) <= $ms]] and EventData[Data[@Name='LmPackageName']='NTLM V1']]"
     )
     foreach ($dc in $DCs) {
         foreach ($q in $queries) {
@@ -1772,6 +2072,15 @@ if ($IncludeSecurityEvents) {
                 $acct = $d['TargetUserName']
                 if ($id -eq 4740) {
                     $LockoutRows.Add([pscustomobject][ordered]@{ 'Data/ora' = $e.TimeCreated; 'Account bloccato' = $acct; 'Computer di origine' = $d['TargetDomainName']; 'DC' = $dc.Name })
+                    continue
+                }
+                if ($id -eq 4624) {
+                    $src = $d['IpAddress']; if (-not $src -or $src -eq '-') { $src = $d['WorkstationName'] }
+                    $key = "$acct|$src"
+                    if (-not $NtlmV1Agg.ContainsKey($key)) { $NtlmV1Agg[$key] = [pscustomobject]@{ Account = "$($d['TargetDomainName'])\$acct"; Source = $src; Workstation = $d['WorkstationName']; Hits = 0; Last = $e.TimeCreated; DCs = (New-Object 'System.Collections.Generic.HashSet[string]') } }
+                    $a = $NtlmV1Agg[$key]; $a.Hits++
+                    if ($e.TimeCreated -gt $a.Last) { $a.Last = $e.TimeCreated }
+                    [void]$a.DCs.Add($dc.Name)
                     continue
                 }
                 $dom = ''; $src = ''; $st = ''; $evName = ''
@@ -1809,6 +2118,10 @@ $EventRows = foreach ($a in ($EventAgg.Values | Sort-Object Hits -Descending)) {
         'Motivo' = $(if ($StatusMap[$a.Status]) { "$($StatusMap[$a.Status]) ($($a.Status))" } else { $a.Status })
         'Tentativi' = $a.Hits; 'Primo' = $a.First; 'Ultimo' = $a.Last; 'DC' = @($a.DCs)
     }
+}
+$NtlmV1Rows = foreach ($a in ($NtlmV1Agg.Values | Sort-Object Hits -Descending)) {
+    Add-FL 'ev.ntlmv1' "$($a.Account) da $($a.Source) - $($a.Hits) accessi"
+    [pscustomobject][ordered]@{ 'Account' = $a.Account; 'Origine (IP / host)' = $a.Source; 'Workstation' = $a.Workstation; 'Accessi NTLMv1' = $a.Hits; 'Ultimo' = $a.Last; 'DC' = @($a.DCs) }
 }
 if ($IncludeSecurityEvents -and $EventAgg.Count) {
     # Possibile password spray: stessa origine contro molti account
@@ -1921,13 +2234,40 @@ if ($Nodes.ContainsKey($dcOuDN)) {
     }
 }
 
-# File system
-if ($FolderRisky.Count) { Add-Finding -Severity 'Alto' -Category 'Permessi cartelle' -Title "Permessi di scrittura concessi a gruppi ampi ($($FolderRisky.Count))" -Description 'Everyone / Authenticated Users / Users / Domain Users hanno diritti di modifica: rischio di diffusione ransomware e manomissione dati.' -Recommendation 'Sostituire con gruppi di sicurezza specifici (modello AGDLP) con il minimo privilegio.' -Objects @($FolderRisky | ForEach-Object { "$($_.Percorso) - $($_.'Identità'): $($_.Diritti)" }) -Section 'sec-folders' }
-Add-FindingFromList 'fs.share.everyone' 'Medio' 'Permessi cartelle' 'Condivisioni con Everyone in modifica/controllo completo' 'I permessi di condivisione non limitano l''accesso.' 'Limitare i permessi di condivisione (es. Authenticated Users: Modifica) e gestire il dettaglio con NTFS.' 'sec-folders'
-Add-FindingFromList 'fs.orphan' 'Basso' 'Permessi cartelle' 'ACE con SID orfani (account eliminati)' 'Permessi assegnati ad account/gruppi non più esistenti.' 'Rimuovere le ACE orfane.' 'sec-folders'
-if ($FolderErrors.Count) { Add-Finding -Severity 'Info' -Category 'Permessi cartelle' -Title "Cartelle non analizzabili ($($FolderErrors.Count))" -Description 'Accesso negato o percorso non leggibile con l''account in uso.' -Recommendation 'Eseguire lo script con un account con diritti di lettura (o privilegio di backup).' -Objects @($FolderErrors | ForEach-Object { "$($_.Percorso) - $($_.Errore)" }) -Section 'sec-folders' }
+# Protocolli e hardening dei DC
+Add-FindingFromList 'proto.lmhash' 'Critico' 'Protocolli' 'Hash LM memorizzati sui DC (NoLMHash = 0)' 'Gli hash LM si violano in pochi secondi.' 'Impostare "Sicurezza di rete: non memorizzare il valore hash di LAN Manager" = Abilitato e forzare il cambio password.' 'sec-proto'
+Add-FindingFromList 'proto.wdigest' 'Critico' 'Protocolli' 'WDigest memorizza le password in chiaro (UseLogonCredential = 1)' 'Le password degli utenti connessi sono estraibili in chiaro dalla memoria di LSASS.' 'Impostare UseLogonCredential = 0 (o rimuovere il valore).' 'sec-proto'
+Add-FindingFromList 'proto.netlogon' 'Critico' 'Protocolli' 'Canale sicuro Netlogon indebolito (Zerologon / firma)' 'Eccezioni in VulnerableChannelAllowList o firma/chiave del canale sicuro non obbligatorie.' 'Rimuovere le eccezioni e impostare RequireSignOrSeal = 1 e RequireStrongKey = 1.' 'sec-proto'
+Add-FindingFromList 'proto.ldapsign' 'Alto' 'Protocolli' 'Firma LDAP non obbligatoria sui Domain Controller' 'Senza firma obbligatoria le sessioni LDAP sono esposte ad attacchi di relay NTLM e man-in-the-middle.' 'Individuare i client non conformi (eventi 2887/2889) e impostare "Controller di dominio: requisiti di firma server LDAP" = Richiedi firma.' 'sec-proto'
+Add-FindingFromList 'proto.ntlmv1' 'Alto' 'Protocolli' 'I Domain Controller accettano LM / NTLMv1 (LmCompatibilityLevel < 5)' 'NTLMv1 e LM sono violabili e consentono il relay e il cracking delle credenziali.' 'Verificare l''uso di NTLMv1 (evento 4624, campo "Pacchetto LM") e impostare LmCompatibilityLevel = 5 tramite GPO.' 'sec-proto'
+Add-FindingFromList 'proto.smbsign' 'Alto' 'Protocolli' 'Firma SMB non obbligatoria sui Domain Controller' 'Senza firma SMB è possibile il relay NTLM verso i DC.' 'Impostare "Server di rete Microsoft: aggiungi firma digitale alle comunicazioni (sempre)" = Abilitato.' 'sec-proto'
+Add-FindingFromList 'proto.smb1' 'Alto' 'Protocolli' 'SMBv1 abilitato sui Domain Controller' 'SMBv1 è obsoleto e vulnerabile (es. EternalBlue).' 'Disabilitare SMBv1: Set-SmbServerConfiguration -EnableSMB1Protocol $false e rimuovere la funzionalità FS-SMB1.' 'sec-proto'
+Add-FindingFromList 'proto.spooler' 'Alto' 'Protocolli' 'Print Spooler attivo o non disabilitato sui Domain Controller' 'Il servizio di stampa sui DC espone a PrintNightmare e ad attacchi di coercizione dell''autenticazione (PrinterBug).' 'Arrestare e disabilitare il servizio Spooler sui DC (GPO dedicata all''OU Domain Controllers).' 'sec-proto'
+Add-FindingFromList 'proto.anon' 'Alto' 'Protocolli' 'Accesso anonimo non limitato sui Domain Controller' 'Le impostazioni consentono l''enumerazione anonima di account, condivisioni o includono gli anonimi in Everyone.' 'Applicare RestrictAnonymous = 1, RestrictAnonymousSAM = 1, EveryoneIncludesAnonymous = 0.' 'sec-proto'
+Add-FindingFromList 'proto.anonldap' 'Alto' 'Protocolli' 'Ricerca LDAP anonima consentita' 'Un utente non autenticato può leggere oggetti della directory.' 'Ripristinare dSHeuristics (7° carattere diverso da 2) e rimuovere i permessi di lettura concessi ad ANONYMOUS LOGON.' 'sec-proto'
+Add-FindingFromList 'dom.dsheur' 'Alto' 'Protocolli' 'Operazioni LDAP anonime abilitate (dSHeuristics)' 'Il 7° carattere di dSHeuristics a 2 abilita le operazioni anonime su tutta la foresta.' 'Correggere l''attributo dSHeuristics in CN=Directory Service,CN=Windows NT,CN=Services della configurazione.' 'sec-proto'
+Add-FindingFromList 'proto.dnsupdate' 'Alto' 'Protocolli' 'Zone DNS con aggiornamenti dinamici non sicuri' 'Chiunque in rete può registrare o sovrascrivere record DNS (spoofing, intercettazione).' 'Impostare gli aggiornamenti dinamici su "Solo sicuri" per le zone integrate in AD.' 'sec-proto'
+Add-FindingFromList 'proto.ldaps' 'Medio' 'Protocolli' 'LDAPS non disponibile o con certificato non valido' 'Senza LDAPS valido le applicazioni usano LDAP in chiaro o falliscono quando la firma diventa obbligatoria.' 'Installare sui DC un certificato valido (modello Kerberos Authentication / Domain Controller) e monitorarne la scadenza.' 'sec-proto'
+Add-FindingFromList 'proto.cbt' 'Medio' 'Protocolli' 'Channel binding LDAPS non imposto' 'Senza channel binding le connessioni LDAPS sono esposte al relay NTLM.' 'Impostare "Controller di dominio: requisiti token di binding del canale server LDAP" = Sempre (dopo verifica degli eventi 3039).' 'sec-proto'
+Add-FindingFromList 'proto.tlslegacy' 'Medio' 'Protocolli' 'Protocolli TLS obsoleti abilitati sui Domain Controller' 'SSL 3.0 / TLS 1.0 / TLS 1.1 sono deprecati e vulnerabili.' 'Disabilitare SSL 3.0, TLS 1.0 e 1.1 (SCHANNEL) dopo aver verificato la compatibilità dei client.' 'sec-proto'
+Add-FindingFromList 'proto.rc4' 'Medio' 'Protocolli' 'Kerberos consente RC4 / DES' 'RC4 e DES sono deboli e facilitano Kerberoasting e attacchi offline.' 'Configurare "Sicurezza di rete: configura tipi di crittografia consentiti per Kerberos" = AES128 + AES256 dopo verifica.' 'sec-proto'
+Add-FindingFromList 'proto.ntlmminsec' 'Medio' 'Protocolli' 'Sicurezza minima delle sessioni NTLM non impostata' 'Le sessioni NTLM possono non usare NTLMv2 session security.' 'Impostare "Sicurezza minima sessioni NTLM server" = Richiedi NTLMv2 + crittografia a 128 bit.' 'sec-proto'
+Add-FindingFromList 'proto.ppl' 'Medio' 'Protocolli' 'Protezione LSA (RunAsPPL) non attiva sui Domain Controller' 'LSASS non è un processo protetto: strumenti come Mimikatz possono leggerne la memoria.' 'Abilitare RunAsPPL = 1 (dopo verifica di driver/plugin LSA).' 'sec-proto'
+Add-FindingFromList 'proto.unsignedbinds' 'Medio' 'Protocolli' 'Client che eseguono bind LDAP non firmati o in chiaro (evento 2887)' 'Questi client smetteranno di funzionare quando la firma LDAP diventerà obbligatoria e oggi espongono credenziali.' 'Abilitare la registrazione diagnostica "16 LDAP Interface Events" = 2 per ottenere gli eventi 2889 con gli indirizzi dei client e correggerli.' 'sec-proto'
+Add-FindingFromList 'proto.ntlmaudit' 'Basso' 'Protocolli' 'Audit dell''uso di NTLM non attivo' 'Senza audit non è possibile pianificare la riduzione di NTLM.' 'Abilitare "Sicurezza di rete: limita NTLM: controlla autenticazione NTLM in questo dominio" = Abilita tutto.' 'sec-proto'
+Add-FindingFromList 'proto.llmnr' 'Basso' 'Protocolli' 'LLMNR non disattivato tramite criterio' 'LLMNR consente attacchi di poisoning (es. Responder) per catturare hash NTLM.' 'Disattivare LLMNR via GPO su tutti i computer ("Disattiva risoluzione nomi multicast").' 'sec-proto'
+Add-FindingFromList 'proto.time' 'Basso' 'Protocolli' 'Emulatore PDC senza sorgente oraria NTP esterna' 'L''emulatore PDC è la sorgente oraria del dominio: un orario errato causa errori Kerberos.' 'Configurare w32tm sul PDC con /syncfromflags:manual e server NTP affidabili.' 'sec-proto'
+Add-FindingFromList 'proto.unreachable' 'Info' 'Protocolli' 'Domain Controller non interrogabili per i controlli di configurazione' 'Né WinRM né il Registro remoto hanno risposto: i controlli di protocollo per questi DC sono incompleti.' 'Abilitare WinRM sui DC (Enable-PSRemoting) o eseguire lo script direttamente su un DC.' 'sec-proto'
+Add-FindingFromList 'dom.dcsync' 'Critico' 'Permessi AD' 'Principali non standard con diritti di replica (DCSync)' 'Questi account possono estrarre gli hash di tutte le password del dominio, incluso krbtgt.' 'Rimuovere i diritti "Replicating Directory Changes All" non necessari (verificare Entra Connect / strumenti di sincronizzazione legittimi).' 'sec-proto'
+Add-FindingFromList 'dom.rootacl' 'Alto' 'Permessi AD' 'Permessi di modifica su radice del dominio o AdminSDHolder a principali non standard' 'Chi può modificare le ACL della radice o di AdminSDHolder può concedersi privilegi di Domain Admin o DCSync.' 'Rimuovere le ACE non necessarie (es. Exchange Windows Permissions con WriteDacl).' 'sec-proto'
+Add-FindingFromList 'dom.gpp' 'Critico' 'GPO' 'Password memorizzate nelle Group Policy Preferences (cpassword)' 'La chiave AES delle GPP è pubblica: chiunque legga SYSVOL ottiene le password in chiaro.' 'Eliminare le preferenze con password, cambiare immediatamente le password esposte e usare LAPS / gMSA.' 'sec-proto'
+Add-FindingFromList 'adcs.esc1' 'Critico' 'AD CS' 'Modelli di certificato vulnerabili a ESC1' 'Gruppi ampi possono richiedere un certificato di autenticazione indicando un soggetto arbitrario (es. un Domain Admin).' 'Disattivare "Fornisci nella richiesta", richiedere l''approvazione del manager o limitare l''enrollment.' 'sec-adcs'
+Add-FindingFromList 'adcs.esc4' 'Critico' 'AD CS' 'Modelli di certificato modificabili da gruppi ampi (ESC4)' 'Chi può modificare il modello può renderlo vulnerabile (ESC1) e ottenere certificati privilegiati.' 'Rimuovere i permessi di scrittura concessi a gruppi ampi.' 'sec-adcs'
+Add-FindingFromList 'adcs.esc2' 'Alto' 'AD CS' 'Modelli di certificato "qualsiasi scopo" o Certificate Request Agent (ESC2 / ESC3)' 'Gruppi ampi possono ottenere certificati utilizzabili per qualsiasi scopo o per richiedere certificati per conto di altri.' 'Limitare l''enrollment e gli EKU dei modelli indicati.' 'sec-adcs'
+Add-FindingFromList 'u.spn.rc4' 'Medio' 'Utenti' 'Account con SPN senza crittografia AES abilitata' 'I ticket di servizio vengono emessi in RC4, molto più rapido da violare offline (Kerberoasting).' 'Abilitare AES128/AES256 sull''account (msDS-SupportedEncryptionTypes = 0x18) e cambiare la password, oppure migrare a gMSA.' 'sec-users'
 
 # Eventi
+Add-FindingFromList 'ev.ntlmv1' 'Alto' 'Eventi' 'Accessi con autenticazione NTLMv1' "Accessi (evento 4624) autenticati con NTLM V1 nelle ultime $EventHours ore: NTLMv1 è violabile e consente attacchi di relay e cracking." 'Aggiornare o riconfigurare i client indicati e impostare LmCompatibilityLevel = 5 su DC e client.' 'sec-events'
 Add-FindingFromList 'ev.spray' 'Alto' 'Eventi' 'Possibile password spray: stessa origine con errori su molti account' "Rilevate origini con tentativi falliti su 10 o più account distinti nelle ultime $EventHours ore." 'Indagare le origini indicate, bloccarle se malevole e verificare gli account coinvolti.' 'sec-events'
 Add-FindingFromList 'ev.brute' 'Medio' 'Eventi' 'Account con numerosi accessi falliti' "Account con almeno 20 tentativi falliti nelle ultime $EventHours ore." 'Verificare se si tratta di credenziali memorizzate obsolete o di attacchi.' 'sec-events'
 if ($LockoutRows.Count) { Add-Finding -Severity 'Info' -Category 'Eventi' -Title "Blocchi account registrati ($($LockoutRows.Count))" -Description "Eventi 4740 nelle ultime $EventHours ore." 'Verificare i computer di origine dei blocchi.' -Objects @($LockoutRows | ForEach-Object { "$(Format-Date $_.'Data/ora') - $($_.'Account bloccato') da $($_.'Computer di origine')" }) -Section 'sec-events' }
@@ -1941,7 +2281,7 @@ $Findings = @($script:Findings | Sort-Object @{ Expression = { @{ 'Critico' = 0;
 Write-Step 'Generazione del report HTML'
 
 $SevClass = @{ 'Critico' = 'b-crit'; 'Alto' = 'b-high'; 'Medio' = 'b-med'; 'Basso' = 'b-low'; 'Info' = 'b-info' }
-$SectionNames = @{ 'sec-domain' = 'Dominio'; 'sec-dc' = 'Domain Controller'; 'sec-sites' = 'Siti e trust'; 'sec-pwd' = 'Policy'; 'sec-users' = 'Utenti'; 'sec-special' = 'Account speciali'; 'sec-priv' = 'Gruppi privilegiati'; 'sec-groups' = 'Gruppi'; 'sec-computers' = 'Computer'; 'sec-deleg' = 'Deleghe'; 'sec-ou' = 'OU'; 'sec-gpo' = 'GPO'; 'sec-folders' = 'Permessi'; 'sec-events' = 'Eventi' }
+$SectionNames = @{ 'sec-domain' = 'Dominio'; 'sec-dc' = 'Domain Controller'; 'sec-sites' = 'Siti e trust'; 'sec-pwd' = 'Policy'; 'sec-users' = 'Utenti'; 'sec-special' = 'Account speciali'; 'sec-priv' = 'Gruppi privilegiati'; 'sec-groups' = 'Gruppi'; 'sec-computers' = 'Computer'; 'sec-deleg' = 'Deleghe'; 'sec-ou' = 'OU'; 'sec-gpo' = 'GPO'; 'sec-proto' = 'Protocolli'; 'sec-adcs' = 'AD CS'; 'sec-events' = 'Eventi' }
 
 $FindingRows = foreach ($f in $Findings) {
     $objHtml = ''
@@ -2002,6 +2342,8 @@ $sb = New-Object System.Text.StringBuilder
 [void]$sb.Append((New-Card 'OU' $RawOUs.Count '' '#sec-ou'))
 [void]$sb.Append((New-Card 'GPO' $RawGpos.Count '' '#sec-gpo'))
 [void]$sb.Append((New-Card 'GPO non collegate' (Get-FLItems 'gpo.unlinked').Count))
+[void]$sb.Append((New-Card 'Problemi protocolli DC' @($ProtoRows | Where-Object { $_._RowClass -in 'r-Critico', 'r-Attenzione' }).Count 'c-med' '#sec-proto'))
+[void]$sb.Append((New-Card 'Modelli AD CS vulnerabili' @($AdcsRows | Where-Object { $_._RowClass -eq 'f-issue' }).Count 'c-high' '#sec-adcs'))
 [void]$sb.Append('</div>')
 if (-not $QueryAllDCs) { [void]$sb.Append("<div class='note'>Ultimo logon basato su <b>lastLogonTimestamp</b> (replicato, ritardo fino a ~14 giorni). Per il valore preciso eseguire con <code>-QueryAllDCs</code>.</div>") }
 [void]$sb.Append("<div class='note'>Tentativi di password errati e stato di blocco letti dal DC <b>$(Enc $Server)</b>$(if ($Server -eq $Domain.PDCEmulator) { ' (emulatore PDC: valore più affidabile)' }). Il contatore badPwdCount si azzera dopo un accesso riuscito o allo scadere della finestra di osservazione.</div>")
@@ -2094,24 +2436,32 @@ if ($SysvolOrphans.Count) { $h += "<h3>Cartelle orfane in SYSVOL</h3><div class=
 Add-Section 'sec-gpo' 'Group Policy Object' $h 'Tutte le GPO del dominio con stato, versioni, collegamenti, filtri WMI e coerenza SYSVOL.' $RawGpos.Count
 Export-ReportCsv @($GpoRows) 'GPO'
 
-# --- Permessi cartelle ---
-if (-not $SkipFolderReport -and $FolderPath) {
-    $h = "<div class='note'>Per le sottocartelle sono mostrate solo le ACE <b>esplicite</b>$(if ($IncludeInheritedAces) { ' e quelle ereditate' }); la radice mostra tutte le ACE effettive. In rosso le ACE che concedono scrittura a gruppi ampi (Everyone, Authenticated Users, Users, Domain Users...).$(if ($script:FolderTruncated) { " <b>Raggiunto il limite di $MaxFolders cartelle: analisi parziale.</b>" })</div>"
-    if ($ShareRows.Count) { $h += "<h3>Permessi di condivisione</h3>" + (New-HtmlTable -Data $ShareRows -Id 'tShare' -NoToolbar) }
-    $h += ($FolderSections -join "`n")
-    $h += "<h3>Cartelle con permessi espliciti o ereditarietà disabilitata</h3>" + (New-HtmlTable -Data $FolderExceptions -Id 'tFoldEx' -EmptyText 'Nessuna eccezione: tutte le sottocartelle ereditano i permessi.')
-    $h += "<h3>Permessi di scrittura a gruppi ampi</h3>" + (New-HtmlTable -Data $FolderRisky -Id 'tFoldRisk' -EmptyText 'Nessuna ACE a rischio trovata.')
-    if ($FolderErrors.Count) { $h += "<h3>Errori di accesso</h3>" + (New-HtmlTable -Data $FolderErrors -Id 'tFoldErr') }
-    Add-Section 'sec-folders' 'Permessi cartelle' $h "Struttura ad albero dei permessi NTFS di: $(($FolderPath | ForEach-Object { $_ }) -join ', ')" $script:FolderCount
-    Export-ReportCsv $FolderAces 'Permessi_cartelle_ACE_esplicite'
-    Export-ReportCsv $FolderExceptions 'Permessi_cartelle_eccezioni'
+# --- Protocolli e hardening ---
+$h = "<h3>LDAPS e accesso LDAP anonimo</h3>" + (New-HtmlTable -Data $LdapsRows -Id 'tLdaps' -EmptyText 'Nessun DC verificato.')
+if ($SkipProtocolChecks) { $h += "<div class='note'>Controlli di configurazione dei DC non eseguiti (<code>-SkipProtocolChecks</code>).</div>" }
+else {
+    $h += "<h3>Configurazione di sicurezza dei Domain Controller</h3>" + (New-HtmlTable -Data $ProtoRows -Id 'tProto' -Filters ([ordered]@{ 'Critico' = 'r-Critico'; 'Attenzione' = 'r-Attenzione'; 'OK' = 'r-OK'; 'Info' = 'r-Info'; 'N/D' = 'r-ND' }) -EmptyText 'Nessun dato raccolto.')
+    $h += "<h3>Metodo di raccolta per DC</h3>" + (New-HtmlTable -Data $DcProbeStatus -Id 'tProbe' -NoToolbar)
+    $h += "<h3>Zone DNS</h3>" + (New-HtmlTable -Data $DnsZoneRows -Id 'tDns' -EmptyText 'Nessuna zona DNS letta (ruolo DNS assente o modulo DnsServer non disponibile).')
 }
+$h += "<h3>Impostazioni di dominio</h3>" + (New-HtmlTable -Data $DomainHardRows -Id 'tDomHard' -NoToolbar)
+$h += "<h3>Permessi critici su radice del dominio e AdminSDHolder</h3>" + (New-HtmlTable -Data $AclRiskRows -Id 'tAclRisk' -EmptyText 'Nessun principale non standard con diritti critici (DCSync, WriteDacl, WriteOwner, controllo completo).')
+$h += "<h3>Password nelle Group Policy Preferences (cpassword)</h3>" + (New-HtmlTable -Data $GppRows -Id 'tGpp' -EmptyText 'Nessun file GPP con password trovato in SYSVOL.')
+$h += "<div class='note'>I valori &quot;non impostato&quot; sono interpretati secondo i predefiniti di Windows; una GPO non ancora applicata o un riavvio pendente possono far differire il valore effettivo. LDAPS e la ricerca anonima sono verificati in modo attivo dal computer che esegue lo script.</div>"
+Add-Section 'sec-proto' 'Protocolli e hardening' $h 'LDAP signing, channel binding, LDAPS, NTLM/LM, SMB, TLS, Kerberos, Netlogon, protezione credenziali, servizi, DNS, diritti DCSync e GPP.' $ProtoRows.Count
+Export-ReportCsv $ProtoRows 'Protocolli_DC'
+Export-ReportCsv $LdapsRows 'LDAPS'
+
+$h = New-HtmlTable -Data $AdcsRows -Id 'tAdcs' -Filters ([ordered]@{ 'Con problemi' = 'f-issue' }) -EmptyText $(if ($CAs.Count) { 'Nessun modello pubblicato.' } else { 'Nessuna Certification Authority Enterprise trovata nella foresta.' })
+if ($CAs.Count) { $h = "<p class='intro'>Certification Authority: <b>$(Enc (($CAs | ForEach-Object { "$($_.Name) ($($_.dNSHostName))" }) -join ', '))</b></p>" + $h + "<div class='note'>Verificati ESC1-ESC4 sui modelli pubblicati. Non sono verificati ESC6 (EDITF_ATTRIBUTESUBJECTALTNAME2), ESC8 (Web Enrollment HTTP) e le ACL della CA: controllarli con strumenti dedicati (es. Locksmith, Certify).</div>" }
+Add-Section 'sec-adcs' 'Servizi certificati (AD CS)' $h 'Modelli di certificato pubblicati sulle CA Enterprise e configurazioni sfruttabili per l''escalation di privilegi.' $AdcsRows.Count
 
 # --- Eventi ---
 if ($IncludeSecurityEvents) {
     $h = "<h3>Accessi falliti aggregati per account e origine</h3>" + (New-HtmlTable -Data @($EventRows) -Id 'tEvents' -EmptyText 'Nessun accesso fallito trovato nel periodo.')
     $h += "<h3>Blocchi account (4740)</h3>" + (New-HtmlTable -Data $LockoutRows -Id 'tLockouts' -EmptyText 'Nessun blocco nel periodo.')
-    Add-Section 'sec-events' 'Accessi falliti (eventi)' $h "Eventi 4625, 4771, 4776 e 4740 letti dai registri Security dei DC nelle ultime $EventHours ore. Richiede che l'audit sia attivo e che i registri non siano già stati sovrascritti." @($EventRows).Count
+    $h += "<h3>Accessi con NTLMv1 (4624)</h3>" + (New-HtmlTable -Data @($NtlmV1Rows) -Id 'tNtlmV1' -EmptyText 'Nessun accesso NTLMv1 nel periodo.')
+    Add-Section 'sec-events' 'Accessi falliti (eventi)' $h "Eventi 4625, 4771, 4776, 4740 e 4624 (NTLM V1) letti dai registri Security dei DC nelle ultime $EventHours ore. Richiede che l'audit sia attivo e che i registri non siano già stati sovrascritti." @($EventRows).Count
     Export-ReportCsv @($EventRows) 'Accessi_falliti'
 }
 
@@ -2164,7 +2514,6 @@ ul.tree .ty{color:var(--mu);font-size:11px}ul.tree .cnts{color:var(--mu);font-si
 .node{margin:4px 0 8px 22px;padding:8px 12px;background:#f8fafc;border:1px solid var(--bd);border-radius:6px}
 .node .lbl{font-weight:600;margin-top:8px}.node .dn{margin-bottom:4px}
 ol.eff{margin:4px 0 0;padding-left:22px}ol.eff .src{color:var(--mu);font-size:11px}
-.only-x li.fnode[data-x="0"]{display:none}
 .objlist{max-height:260px;overflow:auto;font-family:Consolas,monospace;font-size:11.5px;background:#f8fafc;padding:6px 8px;border-radius:4px;white-space:nowrap}
 details>summary{cursor:pointer}
 code{font-family:Consolas,monospace;background:#f1f5f9;padding:0 4px;border-radius:3px;font-size:11.5px}
@@ -2182,7 +2531,6 @@ function tblFilter(id){var t=document.getElementById(id);if(!t)return;var qi=doc
 function tblSort(th){var table=th.closest('table');var hs=th.parentNode.children;var idx=Array.prototype.indexOf.call(hs,th);var asc=th.getAttribute('data-dir')!=='asc';for(var i=0;i<hs.length;i++)hs[i].removeAttribute('data-dir');th.setAttribute('data-dir',asc?'asc':'desc');var body=table.tBodies[0];var rows=Array.prototype.slice.call(body.rows);var num=/^-?\d+(?:[.,]\d+)?$/;rows.sort(function(a,b){var x=a.cells[idx].textContent.trim(),y=b.cells[idx].textContent.trim();if(x===''&&y!=='')return 1;if(y===''&&x!=='')return -1;var r;if(num.test(x)&&num.test(y)){r=parseFloat(x.replace(',','.'))-parseFloat(y.replace(',','.'));}else{r=x.localeCompare(y,'it',{numeric:true,sensitivity:'base'});}return asc?r:-r;});var f=document.createDocumentFragment();rows.forEach(function(r){f.appendChild(r)});body.appendChild(f);}
 function tblCsv(id){var t=document.getElementById(id);if(!t)return;function q(s){s=(s||'').replace(/\r?\n/g,' | ').replace(/\s+\|\s+/g,' | ').trim();return '"'+s.replace(/"/g,'""')+'"';}var out=[];var h=[];var hc=t.tHead.rows[0].cells;for(var i=0;i<hc.length;i++)h.push(q(hc[i].textContent));out.push(h.join(';'));var rows=t.tBodies[0].rows;for(var j=0;j<rows.length;j++){var r=rows[j];if(r.style.display==='none')continue;var a=[];for(var k=0;k<r.cells.length;k++)a.push(q(r.cells[k].innerText));out.push(a.join(';'));}var blob=new Blob(['\ufeff'+out.join('\r\n')],{type:'text/csv;charset=utf-8'});var l=document.createElement('a');l.href=URL.createObjectURL(blob);l.download=id.replace(/^t/,'')+'.csv';document.body.appendChild(l);l.click();setTimeout(function(){l.remove()},100);}
 function treeAll(id,o){var ds=document.getElementById(id).querySelectorAll('details');for(var i=0;i<ds.length;i++)ds[i].open=o;}
-function treeX(id,cb){document.getElementById(id).classList.toggle('only-x',cb.checked);}
 '@
 
 $runAs = "$([Environment]::UserDomainName)\$([Environment]::UserName)"
@@ -2200,7 +2548,7 @@ foreach ($s in $Sections) {
     if ($s.Intro) { [void]$out.Append("<p class='intro'>$(Enc $s.Intro)</p>") }
     [void]$out.Append($s.Html).Append('</section>')
 }
-$params = "InactiveDays=$InactiveDays; PasswordAgeDays=$PasswordAgeDays; QueryAllDCs=$([bool]$QueryAllDCs); FolderDepth=$FolderDepth; IncludeSecurityEvents=$([bool]$IncludeSecurityEvents)"
+$params = "InactiveDays=$InactiveDays; PasswordAgeDays=$PasswordAgeDays; QueryAllDCs=$([bool]$QueryAllDCs); SkipProtocolChecks=$([bool]$SkipProtocolChecks); IncludeSecurityEvents=$([bool]$IncludeSecurityEvents)"
 [void]$out.Append("<footer>AD Security Report v$ScriptVersion &middot; Parametri: $(Enc $params) &middot; Report in sola lettura: nessuna modifica è stata effettuata.</footer></main><script>$js</script></body></html>")
 
 [System.IO.File]::WriteAllText($ReportFile, $out.ToString(), (New-Object System.Text.UTF8Encoding($true)))

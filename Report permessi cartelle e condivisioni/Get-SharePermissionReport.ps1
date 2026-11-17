@@ -4,14 +4,16 @@
     Report HTML dei permessi NTFS e di condivisione di cartelle locali o share di rete (struttura ad albero).
 
 .DESCRIPTION
-    Non richiede il modulo ActiveDirectory e non esegue query LDAP: legge solo ACL NTFS e permessi SMB.
+    Non richiede il modulo ActiveDirectory (RSAT): legge ACL NTFS e permessi SMB e, per espandere i gruppi,
+    interroga il Domain Controller via LDAP (ADSI) e i gruppi locali del file server (WinNT).
     Il report (un unico file HTML con ricerca, filtri, ordinamento ed esportazione CSV) contiene:
       - Riepilogo e rilevazioni (permessi di scrittura a gruppi ampi, lettura a Everyone, SID orfani,
-        ACE di negazione, ereditarietà disabilitata, errori di accesso)
+        ACE di negazione, ereditarietà disabilitata, utenti disabilitati con accesso, errori di accesso)
       - Permessi di condivisione SMB
       - Albero delle cartelle con proprietario e ACE (esplicite o tutte)
       - Elenco delle cartelle (e opzionalmente dei file) con permessi espliciti o ereditarietà disabilitata
       - Vista "chi ha accesso a cosa" raggruppata per identità
+      - Membri dei gruppi (diretti e annidati, di dominio e locali del server) e accessi effettivi per utente
     Lo script è in SOLA LETTURA.
 
 .PARAMETER Path
@@ -39,6 +41,16 @@
 .PARAMETER MaxFiles
     Numero massimo di file controllati con -IncludeFiles (predefinito 100000).
 
+.PARAMETER SkipGroupExpansion
+    Non espande i gruppi (nessuna query al Domain Controller né ai gruppi locali del server).
+
+.PARAMETER DomainController
+    Domain Controller (o dominio) da interrogare per l'espansione dei gruppi. Predefinito: individuato automaticamente.
+
+.PARAMETER ExpandBroadGroups
+    Espande anche i gruppi "ampi" (Domain Users, Users, Domain Computers...), di norma esclusi perché
+    contengono quasi tutti gli account. Everyone / Authenticated Users non sono comunque espandibili.
+
 .PARAMETER OutputFolder
     Cartella di destinazione del report. Predefinito: cartella dello script.
 
@@ -56,6 +68,9 @@
 
 .EXAMPLE
     .\Get-SharePermissionReport.ps1 -Path 'D:\Condivisioni' -IncludeFiles -IncludeInheritedAces
+
+.EXAMPLE
+    .\Get-SharePermissionReport.ps1 -Path '\\FS01\Dati' -DomainController DC01.contoso.local -ExpandBroadGroups
 #>
 [CmdletBinding()]
 param(
@@ -67,13 +82,16 @@ param(
     [switch]$IncludeInheritedAces,
     [switch]$IncludeFiles,
     [ValidateRange(1, 5000000)][int]$MaxFiles = 100000,
+    [switch]$SkipGroupExpansion,
+    [string]$DomainController,
+    [switch]$ExpandBroadGroups,
     [string]$OutputFolder,
     [switch]$ExportCsv,
     [switch]$OpenReport
 )
 
 Set-StrictMode -Off
-$ScriptVersion = '1.0'
+$ScriptVersion = '1.1'
 $StartTime = Get-Date
 if (-not $OutputFolder) { $OutputFolder = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path } }
 
@@ -445,6 +463,8 @@ function Add-ShareAccess {
                 'Tipo'            = $(if ([string]$sa.AccessControlType -eq 'Allow') { 'Consenti' } else { New-Badge 'Nega' 'b-high' })
                 'Diritto'         = $(switch ([string]$sa.AccessRight) { 'Full' { 'Controllo completo' } 'Change' { 'Modifica' } 'Read' { 'Lettura' } default { [string]$sa.AccessRight } })
                 '_RowClass'       = $(if ($broadWrite) { 'f-risk' } else { '' })
+                '_Sid'            = $sid
+                '_Server'         = $(if ($Server) { $Server } else { $env:COMPUTERNAME })
             }
             $ShareRows.Add($row)
             if ($broadWrite) { $ShareRisky.Add("$unc - $($sa.AccountName): $($row.Diritto)") }
@@ -550,6 +570,326 @@ foreach ($t in ($Targets | Select-Object -Unique)) {
 }
 Write-Progress -Activity 'Analisi permessi' -Completed
 
+#endregion
+
+#region ===================== ESPANSIONE GRUPPI =====================
+
+# Identità -> utenti effettivi. Gruppi di dominio: query LDAP con LDAP_MATCHING_RULE_IN_CHAIN (annidamento
+# risolto dal DC) + utenti con il gruppo come gruppo primario. Gruppi locali del server (BUILTIN\Administrators,
+# gruppi locali...): provider WinNT sul server che ospita i dati; i gruppi di dominio contenuti vengono espansi via LDAP.
+$GroupMemberRows = New-Object System.Collections.Generic.List[object]
+$UserAccessRows = @()
+$script:PrincipalCache = @{}
+$script:ExpandCache = @{}
+$script:LocalGroupCache = @{}
+$script:GroupLog = New-Object System.Collections.Generic.List[string]
+$script:LdapAvailable = $false
+$NotExpandableSids = @('S-1-1-0', 'S-1-5-7', 'S-1-5-11', 'S-1-3-0', 'S-1-3-1', 'S-1-5-18', 'S-1-5-19', 'S-1-5-20', 'S-1-5-2', 'S-1-5-4', 'S-1-5-6', 'S-1-5-9', 'S-1-5-10', 'S-1-5-14', 'S-1-5-15', 'S-1-5-32-546')
+
+function ConvertTo-LdapFilterValue {
+    param([string]$Value)
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($ch in $Value.ToCharArray()) {
+        switch ($ch) { '\' { [void]$sb.Append('\5c') } '*' { [void]$sb.Append('\2a') } '(' { [void]$sb.Append('\28') } ')' { [void]$sb.Append('\29') } ([char]0) { [void]$sb.Append('\00') } default { [void]$sb.Append($ch) } }
+    }
+    return $sb.ToString()
+}
+
+function Get-DomainFromDN {
+    param([string]$DN)
+    return ((@([regex]::Matches($DN, '(?i)DC=([^,]+)') | ForEach-Object { $_.Groups[1].Value })) -join '.')
+}
+
+function Get-LdapPrefix {
+    # Server LDAP per un dominio (DC indicato in -DomainController solo per il dominio predefinito)
+    param([string]$DomainDns)
+    if ($DomainController -and (-not $DomainDns -or $DomainDns -eq $script:DefaultDomainDns)) { return "LDAP://$DomainController/" }
+    if ($DomainDns) { return "LDAP://$DomainDns/" }
+    return 'LDAP://'
+}
+
+function ConvertTo-PrincipalInfo {
+    # Crea l'oggetto descrittivo di un account a partire dalle proprietà LDAP
+    param($Props, [string]$Sid)
+    $oc = @($Props['objectclass'])
+    $uac = 0; if ($Props['useraccountcontrol'] -and @($Props['useraccountcontrol']).Count) { $uac = [int](@($Props['useraccountcontrol'])[0]) }
+    $dn = [string](@($Props['distinguishedname'])[0])
+    $sam = [string](@($Props['samaccountname'])[0])
+    $disp = [string](@($Props['displayname'])[0])
+    $isComp = $oc -contains 'computer'
+    $dom = Get-DomainFromDN $dn
+    [pscustomobject]@{
+        Sid = $Sid; Sam = $sam; DisplayName = $disp; DN = $dn; Domain = $dom
+        Name = $(if ($dom) { "$(($dom -split '\.')[0].ToUpper())\$sam" } else { $sam })
+        IsGroup = ($oc -contains 'group'); IsUser = (($oc -contains 'user') -and -not $isComp); IsComputer = $isComp
+        Enabled = -not ($uac -band 2); Source = 'Dominio'; Fsp = ($oc -contains 'foreignSecurityPrincipal')
+    }
+}
+
+function Get-DirectoryPrincipal {
+    # Risolve un SID di dominio in un oggetto AD (null se non è un oggetto di dominio)
+    param([string]$Sid)
+    if ($script:PrincipalCache.ContainsKey($Sid)) { return $script:PrincipalCache[$Sid] }
+    $info = $null
+    foreach ($prefix in @((Get-LdapPrefix ''), 'GC://')) {
+        try {
+            $e = New-Object System.DirectoryServices.DirectoryEntry("$prefix<SID=$Sid>")
+            $e.RefreshCache([string[]]@('objectClass', 'sAMAccountName', 'displayName', 'distinguishedName', 'userAccountControl'))
+            $props = @{}
+            foreach ($n in 'objectclass', 'samaccountname', 'displayname', 'distinguishedname', 'useraccountcontrol') { $props[$n] = @($e.Properties[$n]) }
+            $info = ConvertTo-PrincipalInfo $props $Sid
+            $e.Dispose()
+            if ($info.DN) { break }
+        } catch { $info = $null }
+    }
+    $script:PrincipalCache[$Sid] = $info
+    return $info
+}
+
+function Invoke-LdapSearch {
+    param([string]$DomainDns, [string]$Filter)
+    $base = ($DomainDns -split '\.' | ForEach-Object { "DC=$_" }) -join ','
+    $root = New-Object System.DirectoryServices.DirectoryEntry("$(Get-LdapPrefix $DomainDns)$base")
+    $ds = New-Object System.DirectoryServices.DirectorySearcher($root)
+    $ds.Filter = $Filter
+    $ds.PageSize = 1000
+    $ds.SearchScope = 'Subtree'
+    foreach ($p in 'objectClass', 'sAMAccountName', 'displayName', 'distinguishedName', 'userAccountControl', 'objectSid') { [void]$ds.PropertiesToLoad.Add($p) }
+    try {
+        foreach ($r in $ds.FindAll()) {
+            $sid = (New-Object System.Security.Principal.SecurityIdentifier(([byte[]]@($r.Properties['objectsid'])[0]), 0)).Value
+            $props = @{}
+            foreach ($n in 'objectclass', 'samaccountname', 'displayname', 'distinguishedname', 'useraccountcontrol') { $props[$n] = @($r.Properties[$n]) }
+            ConvertTo-PrincipalInfo $props $sid
+        }
+    } finally { $ds.Dispose(); $root.Dispose() }
+}
+
+function Expand-DomainGroup {
+    # Restituisce @{ Users = utenti effettivi; Groups = gruppi annidati; Other = membri non espandibili }
+    param($Group, [int]$Depth = 0)
+    if ($script:ExpandCache.ContainsKey($Group.Sid)) { return $script:ExpandCache[$Group.Sid] }
+    $res = [pscustomobject]@{ Users = @{}; Groups = New-Object System.Collections.Generic.List[string]; Other = New-Object System.Collections.Generic.List[string]; Error = $null }
+    $script:ExpandCache[$Group.Sid] = $res
+    try {
+        $dnF = ConvertTo-LdapFilterValue $Group.DN
+        foreach ($u in @(Invoke-LdapSearch $Group.Domain "(&(objectCategory=person)(objectClass=user)(memberOf:1.2.840.113556.1.4.1941:=$dnF))")) { $res.Users[$u.Sid] = $u }
+        $rid = ($Group.Sid -split '-')[-1]
+        foreach ($u in @(Invoke-LdapSearch $Group.Domain "(&(objectCategory=person)(objectClass=user)(primaryGroupID=$rid))")) { if ($u.Sid.StartsWith(($Group.Sid -replace '-\d+$', ''))) { $res.Users[$u.Sid] = $u } }
+        $nested = @(Invoke-LdapSearch $Group.Domain "(&(objectCategory=group)(memberOf:1.2.840.113556.1.4.1941:=$dnF))")
+        foreach ($g in $nested) { $res.Groups.Add($g.Name) }
+        # Membri di altri domini/foreste (foreignSecurityPrincipal): espansi se risolvibili tramite Global Catalog
+        foreach ($grpDn in @($Group.DN) + @($nested | ForEach-Object { $_.DN })) {
+            foreach ($fsp in @(Invoke-LdapSearch $Group.Domain "(&(objectClass=foreignSecurityPrincipal)(memberOf=$(ConvertTo-LdapFilterValue $grpDn)))")) {
+                $p = if ($NotExpandableSids -notcontains $fsp.Sid) { Get-DirectoryPrincipal $fsp.Sid } else { $null }
+                $label = Resolve-SidName $fsp.Sid; if (-not $label) { $label = $fsp.Sid }
+                if ($p -and $p.IsUser) { $res.Users[$p.Sid] = $p }
+                elseif ($p -and $p.IsGroup -and $Depth -lt 5) {
+                    $sub = Expand-DomainGroup $p ($Depth + 1)
+                    foreach ($k in $sub.Users.Keys) { $res.Users[$k] = $sub.Users[$k] }
+                    $res.Groups.Add($label)
+                } else { $res.Other.Add($label) }
+            }
+        }
+        $script:LdapAvailable = $true
+    } catch {
+        $res.Error = $_.Exception.Message
+        $script:GroupLog.Add("$($Group.Name): $($_.Exception.Message)")
+    }
+    return $res
+}
+
+function Get-LocalGroupMap {
+    # Gruppi locali del server (SID -> oggetto ADSI WinNT)
+    param([string]$Server)
+    if ($script:LocalGroupCache.ContainsKey($Server)) { return $script:LocalGroupCache[$Server] }
+    $map = @{}
+    try {
+        $comp = [ADSI]"WinNT://$Server,computer"
+        [void]$comp.Children.SchemaFilter.Add('group')
+        foreach ($g in $comp.Children) {
+            try { $map[(New-Object System.Security.Principal.SecurityIdentifier([byte[]]$g.Properties['objectSid'].Value, 0)).Value] = $g } catch { }
+        }
+    } catch { $script:GroupLog.Add("Gruppi locali di $($Server): $($_.Exception.Message)") }
+    $script:LocalGroupCache[$Server] = $map
+    return $map
+}
+
+function Expand-LocalGroup {
+    param([string]$Server, $AdsiGroup, [string]$Sid)
+    $key = "$Server|$Sid"
+    if ($script:ExpandCache.ContainsKey($key)) { return $script:ExpandCache[$key] }
+    $res = [pscustomobject]@{ Users = @{}; Groups = New-Object System.Collections.Generic.List[string]; Other = New-Object System.Collections.Generic.List[string]; Error = $null }
+    $script:ExpandCache[$key] = $res
+    try {
+        foreach ($m in @($AdsiGroup.psbase.Invoke('Members'))) {
+            $t = $m.GetType()
+            $msid = (New-Object System.Security.Principal.SecurityIdentifier([byte[]]$t.InvokeMember('objectSid', 'GetProperty', $null, $m, $null), 0)).Value
+            $mpath = [string]$t.InvokeMember('ADsPath', 'GetProperty', $null, $m, $null)
+            $mclass = [string]$t.InvokeMember('Class', 'GetProperty', $null, $m, $null)
+            $mname = [string]$t.InvokeMember('Name', 'GetProperty', $null, $m, $null)
+            if ($NotExpandableSids -contains $msid -or $msid -notlike 'S-1-5-21-*') {
+                $n = Resolve-SidName $msid; $res.Other.Add($(if ($n) { $n } else { $mname })); continue
+            }
+            $isLocalAccount = $mpath -match "^WinNT://[^/]+/$([regex]::Escape($Server))/" -or $mpath -match "^WinNT://$([regex]::Escape($Server))/"
+            $p = if ($isLocalAccount) { $null } else { Get-DirectoryPrincipal $msid }
+            if ($p -and $p.IsGroup) {
+                if ((Test-BroadSid $msid) -and -not $ExpandBroadGroups) { $res.Other.Add("$($p.Name) (gruppo ampio, non espanso)"); continue }
+                $sub = Expand-DomainGroup $p
+                foreach ($k in $sub.Users.Keys) { $res.Users[$k] = $sub.Users[$k] }
+                $res.Groups.Add($p.Name); foreach ($g in $sub.Groups) { $res.Groups.Add($g) }
+            } elseif ($p -and $p.IsUser) { $res.Users[$p.Sid] = $p }
+            elseif ($mclass -eq 'User') {
+                $flags = 0; try { $flags = [int]$t.InvokeMember('UserFlags', 'GetProperty', $null, $m, $null) } catch { }
+                $res.Users[$msid] = [pscustomobject]@{ Sid = $msid; Sam = $mname; DisplayName = ''; DN = ''; Domain = $Server; Name = "$Server\$mname"; IsGroup = $false; IsUser = $true; IsComputer = $false; Enabled = -not ($flags -band 2); Source = "Locale ($Server)"; Fsp = $false }
+            } elseif ($p) { $res.Other.Add($p.Name) }
+            else { $res.Other.Add("$mname (non risolto: Domain Controller non raggiungibile?)") }
+        }
+    } catch {
+        $res.Error = $_.Exception.Message
+        $script:GroupLog.Add("Gruppo locale $Sid su $($Server): $($_.Exception.Message)")
+    }
+    return $res
+}
+
+function Get-ServerFromPath {
+    param([string]$Path)
+    if ($Path -match '^\\\\([^\\]+)\\') { return $matches[1] }
+    return $env:COMPUTERNAME
+}
+
+# Risoluzione di un SID nel contesto del server che ospita i dati
+function Resolve-AccessPrincipal {
+    param([string]$Sid, [string]$Server)
+    $key = "$Server|$Sid"
+    if ($script:PrincipalCache.ContainsKey("ctx|$key")) { return $script:PrincipalCache["ctx|$key"] }
+    $r = [pscustomobject]@{ Kind = 'Altro'; Info = $null; Expansion = $null; Origin = ''; Note = '' }
+    if ($NotExpandableSids -contains $Sid) { $r.Kind = 'Speciale'; $r.Note = 'Identità speciale: include tutti gli utenti (non espandibile)' }
+    elseif ($Sid -like 'S-1-5-32-*' -or $Sid -like 'S-1-5-21-*') {
+        $p = if ($Sid -like 'S-1-5-21-*') { Get-DirectoryPrincipal $Sid } else { $null }
+        if ($p -and $p.IsUser) { $r.Kind = 'Utente'; $r.Info = $p; $r.Origin = 'Dominio' }
+        elseif ($p -and $p.IsComputer) { $r.Kind = 'Computer'; $r.Info = $p; $r.Origin = 'Dominio' }
+        elseif ($p -and $p.IsGroup) {
+            $r.Kind = 'Gruppo'; $r.Info = $p; $r.Origin = 'Dominio'
+            if ((Test-BroadSid $Sid) -and -not $ExpandBroadGroups) { $r.Note = 'Gruppo ampio: non espanso (usare -ExpandBroadGroups)' }
+            else { $r.Expansion = Expand-DomainGroup $p }
+        } else {
+            $lg = (Get-LocalGroupMap $Server)[$Sid]
+            if ($lg) {
+                $r.Kind = 'Gruppo'; $r.Origin = "Locale ($Server)"
+                $r.Info = [pscustomobject]@{ Sid = $Sid; Name = "$Server\$($lg.Name)"; Enabled = $true }
+                if ((Test-BroadSid $Sid) -and -not $ExpandBroadGroups) { $r.Note = 'Gruppo ampio: non espanso (usare -ExpandBroadGroups)' }
+                else { $r.Expansion = Expand-LocalGroup -Server $Server -AdsiGroup $lg -Sid $Sid }
+            } elseif ($Sid -like 'S-1-5-21-*') {
+                $n = Resolve-SidName $Sid
+                if ($n -and $n -like "$Server\*") {
+                    $r.Kind = 'Utente'; $r.Origin = "Locale ($Server)"; $r.Info = [pscustomobject]@{ Sid = $Sid; Sam = $n; Name = $n; DisplayName = ''; Enabled = $null; Source = "Locale ($Server)" }
+                } elseif ($n) {
+                    # Account di dominio non interrogabile (DC non raggiungibile o dominio esterno): tipo sconosciuto
+                    $r.Kind = 'NonRisolto'; $r.Origin = 'Non risolto'; $r.Info = [pscustomobject]@{ Sid = $Sid; Name = $n }
+                    $r.Note = 'Non espanso: Domain Controller non raggiungibile o dominio non attendibile'
+                }
+            }
+        }
+    }
+    $script:PrincipalCache["ctx|$key"] = $r
+    return $r
+}
+
+if (-not $SkipGroupExpansion) {
+    Write-Step 'Espansione dei gruppi (Domain Controller e gruppi locali)'
+    try { $script:DefaultDomainDns = [System.DirectoryServices.ActiveDirectory.Domain]::GetComputerDomain().Name } catch { $script:DefaultDomainDns = $env:USERDNSDOMAIN }
+
+    # Coppie (SID, server) da risolvere: ACE NTFS e permessi di condivisione
+    $refs = New-Object System.Collections.Generic.List[object]
+    foreach ($a in $AllAces) { $refs.Add([pscustomobject]@{ Sid = $a.SID; Server = (Get-ServerFromPath $a.Percorso); Path = $a.Percorso; Rights = $a.Diritti; Type = $a.Tipo; Kind = 'NTFS'; Identity = $a.'Identità' }) }
+    foreach ($s in $ShareRows) { if ($s._Sid) { $refs.Add([pscustomobject]@{ Sid = $s._Sid; Server = $s._Server; Path = $s.Condivisione; Rights = "Condivisione: $($s.Diritto)"; Type = $(if ($s.Tipo -is [string]) { $s.Tipo } else { 'Nega' }); Kind = 'Condivisione'; Identity = $s.Account }) } }
+
+    $pairs = @($refs | Select-Object Sid, Server -Unique)
+    $i = 0
+    $resolved = @{}
+    foreach ($pr in $pairs) {
+        $i++
+        Write-Progress -Activity 'Espansione gruppi' -Status "$i / $($pairs.Count)" -PercentComplete ([math]::Min(100, $i * 100 / [math]::Max(1, $pairs.Count)))
+        $resolved["$($pr.Server)|$($pr.Sid)"] = Resolve-AccessPrincipal -Sid $pr.Sid -Server $pr.Server
+    }
+    Write-Progress -Activity 'Espansione gruppi' -Completed
+
+    # Tabella membri dei gruppi
+    $seenGroups = @{}
+    foreach ($k in $resolved.Keys) {
+        $r = $resolved[$k]
+        if ($r.Kind -notin 'Gruppo', 'NonRisolto') { continue }
+        $gkey = "$($r.Origin)|$($r.Info.Sid)"
+        if ($seenGroups.ContainsKey($gkey)) { continue }
+        $seenGroups[$gkey] = $true
+        $users = if ($r.Expansion) { @($r.Expansion.Users.Values | Sort-Object Name) } else { @() }
+        $enabledU = @($users | Where-Object { $_.Enabled -ne $false })
+        $note = @()
+        if ($r.Note) { $note += $r.Note }
+        if ($r.Expansion -and $r.Expansion.Error) { $note += "Errore: $($r.Expansion.Error)" }
+        if ($r.Expansion -and -not $r.Expansion.Error -and $users.Count -eq 0) { $note += 'Nessun utente' }
+        $GroupMemberRows.Add([pscustomobject][ordered]@{
+                'Gruppo'            = $r.Info.Name
+                'Origine'           = $r.Origin
+                'Utenti effettivi'  = $(if ($r.Expansion) { $users.Count } else { $null })
+                'Utenti abilitati'  = $(if ($r.Expansion) { $enabledU.Count } else { $null })
+                'Utenti'            = @($users | Select-Object -First 500 | ForEach-Object { $lbl = $_.Name + $(if ($_.DisplayName) { " ($($_.DisplayName))" } else { '' }); if ($_.Enabled -eq $false) { New-Badge "$lbl - disabilitato" 'b-off' } else { $lbl } })
+                'Gruppi annidati'   = $(if ($r.Expansion) { @($r.Expansion.Groups | Select-Object -Unique) } else { @() })
+                'Altri membri'      = $(if ($r.Expansion) { @($r.Expansion.Other | Select-Object -Unique) } else { @() })
+                'Note'              = @($note)
+                '_RowClass'         = $(if ($r.Note -like 'Gruppo ampio*') { 'f-broad' } elseif ($r.Kind -eq 'NonRisolto') { 'f-unres' } elseif ($users.Count -eq 0) { 'f-empty' } else { '' })
+                '_Sid'              = $r.Info.Sid
+                '_Count'            = $users.Count
+                '_Expanded'         = [bool]$r.Expansion
+            })
+    }
+
+    # Accessi effettivi per utente (ACE dirette + appartenenza ai gruppi)
+    $perUser = @{}
+    foreach ($ref in $refs) {
+        $r = $resolved["$($ref.Server)|$($ref.Sid)"]
+        if (-not $r) { continue }
+        $targets = @()
+        if ($r.Kind -eq 'Utente') { $targets = @(@{ U = $r.Info; Via = 'diretto' }) }
+        elseif ($r.Kind -eq 'Gruppo' -and $r.Expansion) { $targets = @($r.Expansion.Users.Values | ForEach-Object { @{ U = $_; Via = "tramite $($r.Info.Name)" } }) }
+        foreach ($t in $targets) {
+            $u = $t.U
+            if (-not $perUser.ContainsKey($u.Sid)) { $perUser[$u.Sid] = [pscustomobject]@{ User = $u; Items = (New-Object System.Collections.Generic.List[string]); Paths = (New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)); Groups = (New-Object 'System.Collections.Generic.HashSet[string]'); Deny = 0; Write = 0 } }
+            $pu = $perUser[$u.Sid]
+            [void]$pu.Paths.Add($ref.Path)
+            if ($t.Via -ne 'diretto') { [void]$pu.Groups.Add($r.Info.Name) }
+            if ($ref.Type -eq 'Nega') { $pu.Deny++ }
+            if ($ref.Rights -match 'Controllo completo|Modifica|Scrittura') { $pu.Write++ }
+            if ($pu.Items.Count -lt 500) { $pu.Items.Add("$($ref.Path) -> $($ref.Rights) [$($t.Via)]$(if ($ref.Type -eq 'Nega') { ' [NEGA]' })") }
+        }
+    }
+    $UserAccessRows = @(foreach ($pu in ($perUser.Values | Sort-Object { $_.User.Name })) {
+            $u = $pu.User
+            $disabled = ($u.Enabled -eq $false)
+            [pscustomobject][ordered]@{
+                'Utente'              = $u.Name
+                'Nome'                = $u.DisplayName
+                'Stato'               = $(if ($null -eq $u.Enabled) { 'n/d' } elseif ($disabled) { New-Badge 'Disabilitato' 'b-off' } else { New-Badge 'Abilitato' 'b-ok' })
+                'Origine'             = $u.Source
+                'Percorsi'            = $pu.Paths.Count
+                'Con scrittura'       = $pu.Write
+                'Tramite gruppi'      = @($pu.Groups | Sort-Object)
+                'Permessi'            = @($pu.Items)
+                '_RowClass'           = $(if ($disabled) { 'f-disabled' } elseif ($pu.Write) { 'f-write' } else { '' })
+                '_Disabled'           = $disabled
+            }
+        })
+    if ($script:GroupLog.Count) { foreach ($l in ($script:GroupLog | Select-Object -Unique)) { Add-Log 'Espansione gruppi' $l } }
+    if (-not $script:LdapAvailable -and @($resolved.Values | Where-Object { $_.Origin -eq 'Dominio' }).Count -eq 0 -and @($refs | Where-Object { $_.Sid -like 'S-1-5-21-*' }).Count) {
+        Add-Log 'Espansione gruppi' 'Nessun Domain Controller raggiungibile o computer non in dominio: espansi solo i gruppi locali.' 'Info'
+    }
+}
+
+#endregion
+
+#region ===================== VISTA PER IDENTITÀ =====================
+
 # Vista per identità: chi ha accesso a cosa (ACE esplicite + ACE della radice)
 $IdentityRows = foreach ($grp in ($AllAces | Group-Object 'Identità' | Sort-Object Count -Descending)) {
     $items = @($grp.Group)
@@ -558,6 +898,7 @@ $IdentityRows = foreach ($grp in ($AllAces | Group-Object 'Identità' | Sort-Obj
         'Identità'         = $grp.Name
         'SID'              = $items[0].SID
         'Gruppo ampio'     = $(if ($broad) { New-Badge 'Sì' 'b-warn' } else { 'No' })
+        'Utenti effettivi' = $($gm = @($GroupMemberRows | Where-Object { $_._Sid -eq $items[0].SID }) | Select-Object -First 1; if ($gm -and $gm._Expanded) { $gm._Count } elseif ($gm) { 'non espanso' } else { '' })
         'Oggetti'          = @($items | Select-Object -ExpandProperty Percorso -Unique).Count
         'Consenti'         = @($items | Where-Object { $_.Tipo -eq 'Consenti' }).Count
         'Nega'             = @($items | Where-Object { $_.Tipo -eq 'Nega' }).Count
@@ -584,11 +925,15 @@ if ($prot.Count) { Add-Finding 'Info' "Cartelle con ereditarietà disabilitata (
 if ($DenyAces.Count) { Add-Finding 'Info' "ACE di tipo Nega ($($DenyAces.Count))" 'Le negazioni esplicite complicano la gestione e possono causare blocchi inattesi.' 'Preferire la rimozione dei permessi alle negazioni esplicite.' @($DenyAces | ForEach-Object { "$($_.Percorso) - $($_.'Identità'): $($_.Diritti)" }) 'sec-exc' }
 if ($FileExceptions.Count) { Add-Finding 'Info' "File con permessi propri ($($FileExceptions.Count))" 'File con ACE esplicite o ereditarietà disabilitata.' 'Gestire i permessi a livello di cartella, non di singolo file.' @($FileExceptions | ForEach-Object { $_.File }) 'sec-files' }
 if ($AccessErrors.Count) { Add-Finding 'Info' "Oggetti non analizzabili ($($AccessErrors.Count))" 'Accesso negato o percorso non leggibile con l''account in uso.' 'Eseguire con un account con diritti di lettura sulle ACL (es. amministratore del file server).' @($AccessErrors | ForEach-Object { "$($_.Percorso) - $($_.Errore)" }) 'sec-err' }
+$disUsers = @($UserAccessRows | Where-Object { $_._Disabled })
+if ($disUsers.Count) { Add-Finding 'Basso' "Utenti disabilitati con permessi ($($disUsers.Count))" 'Account disabilitati che mantengono accessi diretti o tramite gruppi: se riabilitati otterrebbero subito l''accesso ai dati.' 'Rimuovere gli account disabilitati dai gruppi e dalle ACL (o spostarli in un''OU di dismissione con pulizia periodica).' @($disUsers | ForEach-Object { "$($_.Utente) - $($_.Percorsi) percorsi" }) 'sec-users' }
+$emptyGroups = @($GroupMemberRows | Where-Object { $_._Expanded -and $_._Count -eq 0 })
+if ($emptyGroups.Count) { Add-Finding 'Info' "Gruppi con permessi ma senza utenti ($($emptyGroups.Count))" 'Gruppi presenti nelle ACL che non contengono utenti (diretti o annidati).' 'Verificare se i gruppi sono ancora necessari e rimuovere le ACE inutili.' @($emptyGroups | ForEach-Object { $_.Gruppo }) 'sec-groups' }
 if ($script:FolderTruncated) { Add-Finding 'Info' "Raggiunto il limite di $MaxFolders cartelle" 'L''analisi è parziale.' 'Aumentare -MaxFolders o ridurre -Depth / il perimetro.' @() 'sec-tree' }
 
 $SevOrder = @{ 'Critico' = 0; 'Alto' = 1; 'Medio' = 2; 'Basso' = 3; 'Info' = 4 }
 $SevClass = @{ 'Critico' = 'b-crit'; 'Alto' = 'b-high'; 'Medio' = 'b-med'; 'Basso' = 'b-low'; 'Info' = 'b-info' }
-$SecNames = @{ 'sec-risk' = 'Permessi a rischio'; 'sec-shares' = 'Condivisioni'; 'sec-exc' = 'Eccezioni'; 'sec-files' = 'File'; 'sec-err' = 'Errori'; 'sec-tree' = 'Albero' }
+$SecNames = @{ 'sec-risk' = 'Permessi a rischio'; 'sec-shares' = 'Condivisioni'; 'sec-exc' = 'Eccezioni'; 'sec-files' = 'File'; 'sec-err' = 'Errori'; 'sec-tree' = 'Albero'; 'sec-users' = 'Accessi per utente'; 'sec-groups' = 'Membri dei gruppi' }
 $FindingRows = foreach ($f in ($Findings | Sort-Object { $SevOrder[$_.Severity] })) {
     $objHtml = ''
     if ($f.Objects.Count) {
@@ -629,6 +974,10 @@ if ($IncludeFiles) { [void]$sb.Append((New-Card 'File controllati' $script:FileC
 [void]$sb.Append((New-Card 'Cartelle con eccezioni' $FolderExceptions.Count 'c-med' '#sec-exc'))
 [void]$sb.Append((New-Card 'ACE a rischio' $RiskyAces.Count 'c-high' '#sec-risk'))
 [void]$sb.Append((New-Card 'Identità con accesso' @($IdentityRows).Count '' '#sec-ident'))
+if (-not $SkipGroupExpansion) {
+    [void]$sb.Append((New-Card 'Utenti con accesso effettivo' @($UserAccessRows).Count '' '#sec-users'))
+    [void]$sb.Append((New-Card 'Utenti disabilitati con accesso' @($UserAccessRows | Where-Object { $_._Disabled }).Count 'c-low' '#sec-users'))
+}
 [void]$sb.Append((New-Card 'Errori di accesso' $AccessErrors.Count '' '#sec-err'))
 [void]$sb.Append('</div>')
 [void]$sb.Append("<h3>Percorsi analizzati</h3>" + (New-HtmlTable -Data $RootSummary -Id 'tRoots' -NoToolbar))
@@ -649,8 +998,13 @@ $h += "<h3>ACE di negazione</h3>" + (New-HtmlTable -Data $DenyAces -Id 'tDeny' -
 $h += "<h3>SID orfani</h3>" + (New-HtmlTable -Data $OrphanAces -Id 'tOrphan' -EmptyText 'Nessuno.')
 Add-Section 'sec-risk' 'Permessi a rischio' $h 'Gruppi ampi: Everyone, Anonymous, Authenticated Users, Users, Guests, Domain Users, Domain Guests, Domain Computers.' $RiskyAces.Count
 
-Add-Section 'sec-ident' 'Accessi per identità' (New-HtmlTable -Data @($IdentityRows) -Id 'tIdent' -Filters ([ordered]@{ 'Solo gruppi ampi' = 'f-broad' })) 'Chi ha accesso a cosa: per ogni utente/gruppo i percorsi e i diritti assegnati (ACE esplicite e ACE della radice). L''appartenenza ai gruppi non viene espansa.' @($IdentityRows).Count
+Add-Section 'sec-ident' 'Accessi per identità' (New-HtmlTable -Data @($IdentityRows) -Id 'tIdent' -Filters ([ordered]@{ 'Solo gruppi ampi' = 'f-broad' })) 'Chi ha accesso a cosa: per ogni utente/gruppo i percorsi e i diritti assegnati (ACE esplicite e ACE della radice). Per gli utenti che ereditano l''accesso dai gruppi vedere "Accessi per utente".' @($IdentityRows).Count
 
+if (-not $SkipGroupExpansion) {
+    $uf = [ordered]@{ 'Solo disabilitati' = 'f-disabled'; 'Con permessi di scrittura' = 'f-write' }
+    Add-Section 'sec-users' 'Accessi per utente' (New-HtmlTable -Data $UserAccessRows -Id 'tUsers' -Filters $uf -EmptyText 'Nessun utente individuato (gruppi non espandibili o nessun Domain Controller raggiungibile).') 'Accessi effettivi di ogni utente: ACE assegnate direttamente e ACE ereditate dall''appartenenza (anche annidata) ai gruppi di dominio e ai gruppi locali del server. I gruppi ampi (Everyone, Authenticated Users, Domain Users, Users) non sono espansi salvo -ExpandBroadGroups. Le negazioni sono indicate con [NEGA]: i permessi effettivi possono essere inferiori.' @($UserAccessRows).Count
+    Add-Section 'sec-groups' 'Membri dei gruppi' (New-HtmlTable -Data $GroupMemberRows -Id 'tGroups' -Filters ([ordered]@{ 'Gruppi ampi (non espansi)' = 'f-broad'; 'Senza utenti' = 'f-empty'; 'Non risolti' = 'f-unres' }) -EmptyText 'Nessun gruppo nelle ACL analizzate.') 'Gruppi (e identità di dominio non risolte) presenti nelle ACL e nei permessi di condivisione con gli utenti effettivi (appartenenza diretta, annidata e tramite gruppo primario), letti dal Domain Controller o dai gruppi locali del server.' $GroupMemberRows.Count
+}
 if ($IncludeFiles) { Add-Section 'sec-files' 'File con permessi propri' (New-HtmlTable -Data $FileExceptions -Id 'tFiles' -EmptyText 'Nessun file con permessi espliciti.') "File con ACE esplicite o ereditarietà disabilitata (controllati: $($script:FileCount)$(if ($script:FileTruncated) { ", limite di $MaxFiles raggiunto" }))." $FileExceptions.Count }
 
 Add-Section 'sec-acl' 'Tutte le ACE esplicite' (New-HtmlTable -Data $AllAces -Id 'tAces' -Filters ([ordered]@{})) 'Elenco piatto di tutte le ACE esplicite e delle ACE della radice di ogni percorso (utile per esportazione e ricerca).' $AllAces.Count
@@ -661,6 +1015,8 @@ Export-ReportCsv $AllAces 'ACE_esplicite'
 Export-ReportCsv $FolderExceptions 'Cartelle_eccezioni'
 Export-ReportCsv $ShareRows 'Permessi_condivisione'
 Export-ReportCsv @($IdentityRows) 'Accessi_per_identita'
+Export-ReportCsv @($UserAccessRows) 'Accessi_per_utente'
+Export-ReportCsv $GroupMemberRows.ToArray() 'Membri_gruppi'
 Export-ReportCsv $FileExceptions 'File_eccezioni'
 Export-ReportCsv @($FindingRows) 'Rilevazioni'
 
@@ -698,7 +1054,7 @@ table.dt tbody tr:hover td{background:#f8fafc}tr.f-risk td{background:#fff1f2}
 .b-high{background:#fee2e2;color:#991b1b}.b-crit{background:#7f1d1d;color:#fff}
 table.mini{border-collapse:collapse;margin:6px 0;font-size:12px;background:#fff}
 table.mini th{background:#eef2f7;text-align:left;padding:4px 8px}table.mini td{padding:4px 8px;border-top:1px solid #eef2f7}
-tr.ace-inh td{color:#64748b}tr.ace-risk td{background:#fee2e2}tr.ace-deny td{background:#fef3c7}
+tr.f-disabled td{color:#94a3b8}tr.ace-inh td{color:#64748b}tr.ace-risk td{background:#fee2e2}tr.ace-deny td{background:#fef3c7}
 ul.tree,ul.tree ul{list-style:none;margin:0;padding-left:18px}ul.tree{padding-left:0}
 ul.tree ul{border-left:1px dashed #cbd5e1;margin-left:9px}ul.tree li{margin:2px 0}
 ul.tree summary{cursor:pointer;padding:3px 6px;border-radius:5px}ul.tree summary:hover{background:#eff6ff}
@@ -739,7 +1095,7 @@ foreach ($s in $Sections) {
     if ($s.Intro) { [void]$out.Append("<p class='intro'>$(Enc $s.Intro)</p>") }
     [void]$out.Append($s.Html).Append('</section>')
 }
-$params = "Depth=$Depth; MaxFolders=$MaxFolders; IncludeFiles=$([bool]$IncludeFiles); IncludeInheritedAces=$([bool]$IncludeInheritedAces)"
+$params = "Depth=$Depth; MaxFolders=$MaxFolders; IncludeFiles=$([bool]$IncludeFiles); IncludeInheritedAces=$([bool]$IncludeInheritedAces); GroupExpansion=$(-not $SkipGroupExpansion); ExpandBroadGroups=$([bool]$ExpandBroadGroups)"
 [void]$out.Append("<footer>Share Permission Report v$ScriptVersion &middot; Parametri: $(Enc $params) &middot; Report in sola lettura.</footer></main><script>$js</script></body></html>")
 [System.IO.File]::WriteAllText($ReportFile, $out.ToString(), (New-Object System.Text.UTF8Encoding($true)))
 
