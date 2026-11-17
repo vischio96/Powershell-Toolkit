@@ -5,6 +5,8 @@ Report_Permessi_*.html
 Report_Permessi_*_csv/
 Report_FileAudit*.html
 *.evtx
+*.msg
+Destinatari_BCC*.csv
 *.csv
 
 # File temporanei

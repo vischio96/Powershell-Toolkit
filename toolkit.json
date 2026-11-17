@@ -17,6 +17,12 @@
       "name": "Report auditing file",
       "folder": "Report auditing file",
       "script": "Analizza-Evtx.ps1"
+    },
+    {
+      "slug": "outlook-bcc-extract",
+      "name": "Outlook - Estrai BCC da MSG",
+      "folder": "Outlook - Estrai BCC da MSG",
+      "script": "Estrai-BCC.ps1"
     }
   ]
 }

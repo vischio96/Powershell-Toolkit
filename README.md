@@ -10,8 +10,9 @@ Ogni script vive nella propria cartella con **guida** (`README.md`), **registro 
 | [Active Directory security report](Active%20Directory%20security%20report/) | 2.0 | Report HTML di sicurezza e inventario di Active Directory: rilevazioni per gravità, utenti, gruppi privilegiati, computer, GPO, hardening dei protocolli sui DC (LDAP/LDAPS, NTLM, SMB, TLS, Kerberos), DCSync, AD CS |
 | [Report permessi cartelle e condivisioni](Report%20permessi%20cartelle%20e%20condivisioni/) | 1.2 | Report HTML dei permessi NTFS e SMB con struttura ad albero, rilevazioni e accessi effettivi per utente (gruppi espansi dal Domain Controller) |
 | [Report auditing file](Report%20auditing%20file/) | 1.0 | Report HTML dei movimenti sui file (letture, modifiche, eliminazioni, rinomine, permessi) dagli eventi di auditing 4663/4660 di un log `.evtx` |
+| [Outlook - Estrai BCC da MSG](Outlook%20-%20Estrai%20BCC%20da%20MSG/) | 1.0 | Interfaccia grafica per estrarre i destinatari in copia nascosta (BCC) da file `.msg` di Outlook, con esportazione CSV e visualizzazione a video |
 
-Tutti gli script sono **in sola lettura** e producono un report HTML autonomo (apribile offline) con ricerca, filtri, ordinamento ed esportazione CSV.
+Tutti gli script sono **in sola lettura**. Gli script di report producono un file HTML autonomo (apribile offline) con ricerca, filtri, ordinamento ed esportazione CSV.
 
 ## Download
 
