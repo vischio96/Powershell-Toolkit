@@ -8,7 +8,7 @@ Ogni script vive nella propria cartella con **guida** (`README.md`), **registro 
 | Script | Versione | Descrizione |
 | --- | --- | --- |
 | [Active Directory security report](Active%20Directory%20security%20report/) | 2.0 | Report HTML di sicurezza e inventario di Active Directory: rilevazioni per gravità, utenti, gruppi privilegiati, computer, GPO, hardening dei protocolli sui DC (LDAP/LDAPS, NTLM, SMB, TLS, Kerberos), DCSync, AD CS |
-| [Report permessi cartelle e condivisioni](Report%20permessi%20cartelle%20e%20condivisioni/) | 1.1 | Report HTML dei permessi NTFS e SMB con struttura ad albero, rilevazioni e accessi effettivi per utente (gruppi espansi dal Domain Controller) |
+| [Report permessi cartelle e condivisioni](Report%20permessi%20cartelle%20e%20condivisioni/) | 1.2 | Report HTML dei permessi NTFS e SMB con struttura ad albero, rilevazioni e accessi effettivi per utente (gruppi espansi dal Domain Controller) |
 
 Tutti gli script sono **in sola lettura** e producono un report HTML autonomo (apribile offline) con ricerca, filtri, ordinamento ed esportazione CSV.
 

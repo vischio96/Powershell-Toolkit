@@ -2,6 +2,11 @@
 
 Formato basato su [Keep a Changelog](https://keepachangelog.com/it-IT/1.1.0/). Ogni versione corrisponde al tag `share-permission-report-v<versione>`.
 
+## [1.2] - 2026-11-17
+
+### Modificato
+- Rimosso il limite predefinito di 20000 cartelle: vengono analizzate **tutte** le cartelle fino alla profondità impostata con `-Depth`. `-MaxFolders` resta disponibile come limite facoltativo (predefinito 0 = nessun limite).
+
 ## [1.1] - 2026-11-17
 
 ### Aggiunto

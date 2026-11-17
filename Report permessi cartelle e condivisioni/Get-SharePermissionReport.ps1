@@ -30,7 +30,8 @@
     Profondità massima delle sottocartelle (predefinito 5).
 
 .PARAMETER MaxFolders
-    Numero massimo di cartelle analizzate in totale (predefinito 20000).
+    Limite facoltativo al numero totale di cartelle analizzate. Predefinito 0 = nessun limite:
+    vengono analizzate tutte le cartelle fino alla profondità indicata con -Depth.
 
 .PARAMETER IncludeInheritedAces
     Mostra nell'albero anche le ACE ereditate delle sottocartelle (di default solo quelle esplicite).
@@ -78,7 +79,7 @@ param(
     [string[]]$ComputerName,
     [switch]$IncludeAdminShares,
     [ValidateRange(0, 50)][int]$Depth = 5,
-    [ValidateRange(1, 1000000)][int]$MaxFolders = 20000,
+    [ValidateRange(0, [int]::MaxValue)][int]$MaxFolders = 0,
     [switch]$IncludeInheritedAces,
     [switch]$IncludeFiles,
     [ValidateRange(1, 5000000)][int]$MaxFiles = 100000,
@@ -91,7 +92,7 @@ param(
 )
 
 Set-StrictMode -Off
-$ScriptVersion = '1.1'
+$ScriptVersion = '1.2'
 $StartTime = Get-Date
 if (-not $OutputFolder) { $OutputFolder = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path } }
 
@@ -388,7 +389,7 @@ function Get-FolderAclNode {
     if (-not $NoRecurse -and $Level -lt $Depth -and $di) {
         try {
             foreach ($s in @($di.GetDirectories() | Sort-Object Name)) {
-                if ($script:FolderCount -ge $MaxFolders) { $node.Truncated = $true; $script:FolderTruncated = $true; break }
+                if ($MaxFolders -gt 0 -and $script:FolderCount -ge $MaxFolders) { $node.Truncated = $true; $script:FolderTruncated = $true; break }
                 $isReparse = ($s.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
                 $child = Get-FolderAclNode -Path $s.FullName -Level ($Level + 1) -NoRecurse $isReparse
                 if ($isReparse) { $child.Note = 'Collegamento / junction: non esplorato' }
@@ -1095,7 +1096,7 @@ foreach ($s in $Sections) {
     if ($s.Intro) { [void]$out.Append("<p class='intro'>$(Enc $s.Intro)</p>") }
     [void]$out.Append($s.Html).Append('</section>')
 }
-$params = "Depth=$Depth; MaxFolders=$MaxFolders; IncludeFiles=$([bool]$IncludeFiles); IncludeInheritedAces=$([bool]$IncludeInheritedAces); GroupExpansion=$(-not $SkipGroupExpansion); ExpandBroadGroups=$([bool]$ExpandBroadGroups)"
+$params = "Depth=$Depth; MaxFolders=$(if ($MaxFolders -gt 0) { $MaxFolders } else { 'nessun limite' }); IncludeFiles=$([bool]$IncludeFiles); IncludeInheritedAces=$([bool]$IncludeInheritedAces); GroupExpansion=$(-not $SkipGroupExpansion); ExpandBroadGroups=$([bool]$ExpandBroadGroups)"
 [void]$out.Append("<footer>Share Permission Report v$ScriptVersion &middot; Parametri: $(Enc $params) &middot; Report in sola lettura.</footer></main><script>$js</script></body></html>")
 [System.IO.File]::WriteAllText($ReportFile, $out.ToString(), (New-Object System.Text.UTF8Encoding($true)))
 

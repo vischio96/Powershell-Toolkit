@@ -2,7 +2,7 @@
 
 Script PowerShell **in sola lettura** che genera un unico report HTML dei permessi NTFS e di condivisione SMB di cartelle locali, share di rete o di tutte le condivisioni di uno o più file server, con struttura ad albero e accessi effettivi per utente (gruppi espansi dal Domain Controller).
 
-> Versione corrente: **1.1** – [registro revisioni](CHANGELOG.md)
+> Versione corrente: **1.2** – [registro revisioni](CHANGELOG.md)
 
 ## Anteprima
 
@@ -87,7 +87,7 @@ Script PowerShell **in sola lettura** che genera un unico report HTML dei permes
 | `-ComputerName` | – | File server di cui analizzare tutte le condivisioni disco |
 | `-IncludeAdminShares` | – | Con `-ComputerName` include anche `C$`, `ADMIN$`, ... |
 | `-Depth` | 5 | Profondità massima delle sottocartelle |
-| `-MaxFolders` | 20000 | Numero massimo di cartelle analizzate |
+| `-MaxFolders` | 0 (nessun limite) | Limite facoltativo al numero totale di cartelle; con 0 vengono analizzate tutte le cartelle fino a `-Depth` |
 | `-IncludeInheritedAces` | – | Mostra nell'albero anche le ACE ereditate |
 | `-IncludeFiles` | – | Controlla anche i file (più lento) |
 | `-MaxFiles` | 100000 | Numero massimo di file controllati |
