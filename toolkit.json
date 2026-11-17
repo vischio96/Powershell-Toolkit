@@ -1,0 +1,16 @@
+{
+  "scripts": [
+    {
+      "slug": "ad-security-report",
+      "name": "Active Directory security report",
+      "folder": "Active Directory security report",
+      "script": "Get-ADSecurityReport.ps1"
+    },
+    {
+      "slug": "share-permission-report",
+      "name": "Report permessi cartelle e condivisioni",
+      "folder": "Report permessi cartelle e condivisioni",
+      "script": "Get-SharePermissionReport.ps1"
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+# Report generati dagli script (possono contenere dati sensibili: non caricarli mai nel repository)
+AD_Report_*.html
+AD_Report_*_csv/
+Report_Permessi_*.html
+Report_Permessi_*_csv/
+*.csv
+
+# File temporanei
+*.tmp
+*.log
+Thumbs.db
+desktop.ini
+.vscode/
