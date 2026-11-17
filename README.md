@@ -49,6 +49,8 @@ Verifica locale (PowerShell 7):
    git push origin main nuovo-script-v1.0
    ```
 
+   > GitHub non avvia i workflow se si inviano più di 3 tag con un solo push: pubblicare i tag uno alla volta.
+
 ## Sicurezza dei dati
 
 I report generati contengono informazioni sensibili sull'infrastruttura e **non devono essere caricati nel repository** (sono esclusi tramite `.gitignore`).
